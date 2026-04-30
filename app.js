@@ -1,28 +1,7 @@
 // State Management
 let games = JSON.parse(localStorage.getItem('jeopardy_games_v2')) || [];
 if (games.length === 0) {
-    const defaultGame = {
-        id: 'game_' + Date.now(),
-        title: 'Mein Erstes Jeopardy',
-        categories: Array(6).fill(null).map((_, i) => ({
-            name: `Kategorie ${i + 1}`,
-            type: 'standard',
-            questions: Array(5).fill(null).map((_, j) => ({
-                points: (j + 1) * 100,
-                question: '', 
-                answer: '' 
-            }))
-        })),
-        categoriesRound2: Array(6).fill(null).map((_, i) => ({
-            name: `Kategorie ${i + 1} (R2)`,
-            type: 'standard',
-            questions: Array(5).fill(null).map((_, j) => ({
-                points: (j + 1) * 200,
-                question: '',
-                answer: ''
-            }))
-        }))
-    };
+    const defaultGame = createDefaultGame();
     games.push(defaultGame);
     saveGames();
 }
@@ -30,6 +9,23 @@ if (games.length === 0) {
 // Globals
 let activeGameId = localStorage.getItem('jeopardy_active_game_v2') || games[0].id;
 let activeGame = games.find(g => g.id === activeGameId) || games[0];
+
+function setActiveGame(gameId) {
+    activeGameId = gameId;
+    activeGame = games.find(g => g.id === activeGameId) || games[0];
+    localStorage.setItem('jeopardy_active_game_v2', activeGameId);
+}
+
+function promptForGameTitle(defaultValue, actionLabel = 'speichern') {
+    const raw = prompt(`Wie soll der Bausatz heißen?`, defaultValue || '');
+    if (raw === null) return null;
+    const title = raw.trim();
+    if (!title) {
+        alert(`Bitte einen Namen eingeben, um den Bausatz zu ${actionLabel}.`);
+        return null;
+    }
+    return title;
+}
 
 // Migration: Ensure all games have categoriesRound2
 let needsSave = false;
@@ -61,6 +57,33 @@ function buildEmptyQuestion(points) {
         question: '',
         answer: ''
     };
+}
+
+function createDefaultGame(title = 'Mein Erstes Jeopardy') {
+    return {
+        id: 'game_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        title,
+        categories: Array(6).fill(null).map((_, i) => ({
+            name: `Kategorie ${i + 1}`,
+            type: 'standard',
+            questions: Array(5).fill(null).map((_, j) => buildEmptyQuestion((j + 1) * 100))
+        })),
+        categoriesRound2: Array(6).fill(null).map((_, i) => ({
+            name: `Kategorie ${i + 1} (R2)`,
+            type: 'standard',
+            questions: Array(5).fill(null).map((_, j) => buildEmptyQuestion((j + 1) * 200))
+        })),
+        questionsPerCategory: 5,
+        pointMultiplier: 100
+    };
+}
+
+function cloneGame(game, title) {
+    const copy = JSON.parse(JSON.stringify(game));
+    copy.id = 'game_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    copy.title = title;
+    syncGameStructure(copy);
+    return copy;
 }
 
 function syncCategoryQuestions(cat, count, pointsPerQuestion) {
@@ -150,6 +173,408 @@ function syncGameStructure(game) {
     return changed;
 }
 
+function getQuestionMode(cat, q = null) {
+    if (q?.questionType) return q.questionType;
+    if (cat.type !== 'minigame') return 'standard';
+    return cat.minigameType || 'higher_lower';
+}
+
+function renderQuestionTypeOptions(selectedMode) {
+    return `
+        <option value="standard" ${selectedMode === 'standard' ? 'selected' : ''}>Standardfrage</option>
+        <option value="image_question" ${selectedMode === 'image_question' ? 'selected' : ''}>Bildfrage</option>
+        <option value="higher_lower" ${selectedMode === 'higher_lower' ? 'selected' : ''}>Minispiel: HÃ¶her / Tiefer</option>
+        <option value="emoji" ${selectedMode === 'emoji' ? 'selected' : ''}>Minispiel: Emoji-RÃ¤tsel</option>
+        <option value="list_builder" ${selectedMode === 'list_builder' ? 'selected' : ''}>Minispiel: Rangliste nennen</option>
+    `;
+}
+
+function getQuestionStreakLength(cat, q) {
+    return q?.hlStreakLength || cat.hlStreakLength || 1;
+}
+
+function getQuestionListLength(cat, q) {
+    return q?.listLength || cat.listLength || 10;
+}
+
+function getQuestionAiTopic(cat, q) {
+    return (q?.aiPrompt || '').trim() || cat.name;
+}
+
+function getRankedItems(q) {
+    if (!Array.isArray(q.listItems)) q.listItems = [];
+
+    q.listItems = q.listItems
+        .map(item => {
+            if (typeof item === 'string') return item.trim();
+            return (item?.name || item?.text || '').trim();
+        })
+        .filter(Boolean);
+
+    return q.listItems;
+}
+
+function getListPointsPerItem(actQ, items) {
+    return Math.max(1, Math.floor((actQ.points || 0) / Math.max(1, items.length)));
+}
+
+function hasMeaningfulText(value) {
+    return typeof value === 'string' && value.trim().length > 0;
+}
+
+function getQuestionContentState(cat, q) {
+    const mode = getQuestionMode(cat, q);
+    if (mode === 'higher_lower') {
+        const streakLen = getQuestionStreakLength(cat, q);
+        const currentStreak = Array.isArray(q.hlStreak) ? q.hlStreak : [];
+        const filledItems = currentStreak.filter(item =>
+            hasMeaningfulText(item?.object) || hasMeaningfulText(item?.fact)
+        ).length;
+        return {
+            mode,
+            hasQuestion: hasMeaningfulText(q.question),
+            questionText: q.question || '',
+            filledItems,
+            expectedItems: streakLen
+        };
+    }
+
+    if (mode === 'list_builder') {
+        const listLength = getQuestionListLength(cat, q);
+        const currentItems = getRankedItems(q);
+        return {
+            mode,
+            hasQuestion: hasMeaningfulText(q.question),
+            questionText: q.question || '',
+            filledItems: currentItems.length,
+            expectedItems: listLength
+        };
+    }
+
+    if (mode === 'image_question') {
+        return {
+            mode,
+            hasQuestion: hasMeaningfulText(q.question),
+            questionText: q.question || '',
+            hasAnswer: hasMeaningfulText(q.answer),
+            hasImage: hasMeaningfulText(q.image),
+            hasImageQuery: hasMeaningfulText(q.imageQuery)
+        };
+    }
+
+    return {
+        mode,
+        hasQuestion: hasMeaningfulText(q.question),
+        questionText: q.question || '',
+        hasAnswer: hasMeaningfulText(q.answer)
+    };
+}
+
+function mergeAiStreak(existingStreak, parsedStreak, expectedLength) {
+    const merged = [];
+    const safeExisting = Array.isArray(existingStreak) ? existingStreak : [];
+    const safeParsed = Array.isArray(parsedStreak) ? parsedStreak : [];
+
+    for (let i = 0; i < expectedLength; i++) {
+        const current = safeExisting[i] || {};
+        const incoming = safeParsed[i] || {};
+        let solution = current.solution || incoming.solution || incoming.hlSolution || 'Höher';
+        if (!['Höher', 'Tiefer'].includes(solution)) solution = 'Höher';
+
+        merged.push({
+            object: hasMeaningfulText(current.object) ? current.object : (incoming.object || '').trim(),
+            solution,
+            fact: hasMeaningfulText(current.fact) ? current.fact : ((incoming.fact || incoming.hlFact || '').trim())
+        });
+    }
+
+    return merged;
+}
+
+function mergeAiListItems(existingItems, parsedItems, expectedLength) {
+    const merged = [];
+    const safeExisting = Array.isArray(existingItems) ? existingItems : [];
+    const safeParsed = Array.isArray(parsedItems) ? parsedItems : [];
+
+    for (let i = 0; i < expectedLength; i++) {
+        const current = typeof safeExisting[i] === 'string' ? safeExisting[i].trim() : '';
+        const incoming = typeof safeParsed[i] === 'string' ? safeParsed[i].trim() : '';
+        merged.push(current || incoming || '');
+    }
+
+    return merged.filter(Boolean);
+}
+
+function applyAiSlotData(cat, q, aiEntry) {
+    const mode = getQuestionMode(cat, q);
+    let normalizedEntry = aiEntry;
+
+    if ((mode === 'standard' || mode === 'emoji' || mode === 'image_question') && shouldSwapAiQuestionAnswer(aiEntry)) {
+        normalizedEntry = {
+            ...aiEntry,
+            question: aiEntry.answer,
+            answer: aiEntry.question
+        };
+    }
+
+    if (!hasMeaningfulText(q.question) && hasMeaningfulText(normalizedEntry.question)) {
+        q.question = normalizedEntry.question.trim();
+    }
+
+    if (mode === 'higher_lower') {
+        const expectedLength = getQuestionStreakLength(cat, q);
+        q.hlStreak = mergeAiStreak(q.hlStreak, normalizedEntry.hlStreak, expectedLength);
+        return;
+    }
+
+    if (mode === 'list_builder') {
+        const expectedLength = getQuestionListLength(cat, q);
+        q.listItems = mergeAiListItems(q.listItems, normalizedEntry.listItems, expectedLength);
+        return;
+    }
+
+    if (mode === 'image_question') {
+        const isFlagQuestion = isFlagImageQuestion(cat, q);
+        if (isFlagQuestion) {
+            q.question = 'Welche Flagge ist das?';
+        }
+        if (!hasMeaningfulText(q.answer) && hasMeaningfulText(normalizedEntry.answer)) {
+            q.answer = normalizedEntry.answer.trim();
+        }
+        if (!isFlagQuestion && !hasMeaningfulText(q.image) && hasMeaningfulText(normalizedEntry.image)) {
+            q.image = normalizedEntry.image.trim();
+        }
+        if (!hasMeaningfulText(q.imageQuery) && hasMeaningfulText(normalizedEntry.imageQuery)) {
+            q.imageQuery = normalizedEntry.imageQuery.trim();
+        }
+        if (q.progressive === undefined) q.progressive = true;
+        return;
+    }
+
+    if (!hasMeaningfulText(q.answer) && hasMeaningfulText(normalizedEntry.answer)) {
+        q.answer = normalizedEntry.answer.trim();
+    }
+}
+
+function shouldSwapAiQuestionAnswer(aiEntry) {
+    const questionText = String(aiEntry?.question || '').trim();
+    const answerText = String(aiEntry?.answer || '').trim();
+    if (!questionText || !answerText) return false;
+
+    const questionLooksLikePrompt = /[?]$/.test(questionText) || questionText.length > 45;
+    const answerLooksLikePrompt = /[?]$/.test(answerText) || answerText.length > 45;
+    const questionLooksLikeSolution = questionText.length <= 40 && !/[?]$/.test(questionText);
+    const answerLooksLikeSolution = answerText.length <= 40 && !/[?]$/.test(answerText);
+
+    if (answerLooksLikePrompt && questionLooksLikeSolution) return true;
+    if (answerText.length > questionText.length * 1.7 && questionLooksLikeSolution) return true;
+    if (questionLooksLikePrompt && answerLooksLikeSolution) return false;
+    return false;
+}
+
+function getImageSearchQuery(q) {
+    return [
+        q.imageQuery,
+        q.answer,
+        q.aiPrompt,
+        q.question
+    ].map(v => String(v || '').trim()).find(Boolean) || '';
+}
+
+function isFlagImageQuestion(cat, q) {
+    const haystack = [
+        cat?.name,
+        q?.aiPrompt,
+        q?.imageQuery,
+        q?.question,
+        q?.answer
+    ].map(v => String(v || '').toLowerCase()).join(' ');
+
+    return /\bflag\b|flagge|flaggen/.test(haystack);
+}
+
+function getImageQuestionText(cat, q) {
+    if (isFlagImageQuestion(cat, q)) {
+        return 'Welche Flagge ist das?';
+    }
+    return q.question || 'Was ist auf dem Bild zu sehen?';
+}
+
+function getCommonsImageUrlFromPage(page) {
+    const info = page?.imageinfo?.[0];
+    if (!info?.url || !String(info.mime || '').startsWith('image/')) return '';
+    return info.thumburl || info.url || '';
+}
+
+function buildExactFlagFileTitles(query) {
+    const cleanQuery = String(query || '').trim();
+    const flagMatch = cleanQuery.match(/^flag of (.+?)(?:\s+wikimedia commons|\s+svg|\s+png)?$/i);
+    if (!flagMatch) return [];
+
+    const subject = flagMatch[1].trim();
+    return [
+        `File:Flag of ${subject}.svg`,
+        `File:Flag of ${subject}.png`,
+        `File:Flag of the ${subject}.svg`,
+        `File:Flag of the ${subject}.png`
+    ];
+}
+
+async function findCommonsImageByTitles(titles) {
+    const uniqueTitles = [...new Set(titles.filter(Boolean))];
+    if (uniqueTitles.length === 0) return '';
+
+    const url = 'https://commons.wikimedia.org/w/api.php?' + new URLSearchParams({
+        action: 'query',
+        titles: uniqueTitles.join('|'),
+        prop: 'imageinfo',
+        iiprop: 'url|mime',
+        iiurlwidth: '1200',
+        format: 'json',
+        origin: '*'
+    }).toString();
+
+    const response = await fetch(url);
+    if (!response.ok) return '';
+
+    const data = await response.json();
+    const pages = Object.values(data.query?.pages || {});
+    const page = pages.find(p => !p.missing && getCommonsImageUrlFromPage(p));
+    return getCommonsImageUrlFromPage(page);
+}
+
+function scoreWikimediaImagePage(page, query, options = {}) {
+    const imageUrl = getCommonsImageUrlFromPage(page);
+    if (!imageUrl) return -999;
+
+    const title = String(page.title || '').toLowerCase();
+    const url = String(imageUrl || '').toLowerCase();
+    const queryWords = String(query || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const answerWords = String(options.answer || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    let score = 0;
+
+    if (options.isFlag) {
+        if (!title.includes('flag') && !url.includes('flag')) return -999;
+        score += 50;
+        if (title.startsWith('file:flag of ')) score += 35;
+        if (url.endsWith('.svg') || title.endsWith('.svg')) score += 20;
+        if (/historical|proposal|variant|naval|army|president|governor|coat|emblem|map|construction/.test(title)) score -= 50;
+    }
+
+    queryWords.forEach(word => {
+        if (title.includes(word) || url.includes(word)) score += 4;
+    });
+    answerWords.forEach(word => {
+        if (title.includes(word) || url.includes(word)) score += 8;
+    });
+
+    return score;
+}
+
+async function findWikimediaImage(query, options = {}) {
+    const cleanQuery = String(query || '').trim();
+    if (!cleanQuery) return '';
+
+    if (options.isFlag) {
+        const exactImage = await findCommonsImageByTitles(buildExactFlagFileTitles(cleanQuery));
+        if (exactImage) return exactImage;
+    }
+
+    const url = 'https://commons.wikimedia.org/w/api.php?' + new URLSearchParams({
+        action: 'query',
+        generator: 'search',
+        gsrsearch: cleanQuery,
+        gsrnamespace: '6',
+        gsrlimit: '12',
+        prop: 'imageinfo',
+        iiprop: 'url|mime',
+        iiurlwidth: '1200',
+        format: 'json',
+        origin: '*'
+    }).toString();
+
+    const response = await fetch(url);
+    if (!response.ok) return '';
+
+    const data = await response.json();
+    const pages = Object.values(data.query?.pages || {});
+    const bestPage = pages
+        .map(page => ({ page, score: scoreWikimediaImagePage(page, cleanQuery, options) }))
+        .filter(item => item.score > -999)
+        .sort((a, b) => b.score - a.score)[0]?.page;
+
+    return getCommonsImageUrlFromPage(bestPage);
+}
+
+async function autoFillQuestionImage(q, cat = null) {
+    if (!q || hasMeaningfulText(q.image)) return false;
+
+    const isFlag = isFlagImageQuestion(cat, q);
+    const query = isFlag && hasMeaningfulText(q.answer)
+        ? (hasMeaningfulText(q.imageQuery) ? q.imageQuery : `Flag of ${q.answer}`)
+        : getImageSearchQuery(q);
+    if (!query) return false;
+
+    try {
+        const imageUrl = await findWikimediaImage(query, { isFlag, answer: q.answer });
+        if (!imageUrl) return false;
+        q.image = imageUrl;
+        if (isFlag && !hasMeaningfulText(q.imageQuery) && hasMeaningfulText(q.answer)) {
+            q.imageQuery = `Flag of ${q.answer}`;
+        }
+        return true;
+    } catch (err) {
+        console.warn('Bildsuche fehlgeschlagen:', err);
+        return false;
+    }
+}
+
+function getAdaptiveQuestionStyle(text, options = {}) {
+    const rawText = String(text || '').trim();
+    const length = rawText.length;
+    const isEmoji = !!options.isEmoji;
+    const hasImage = !!options.hasImage;
+
+    let fontSize = isEmoji ? '5rem' : '4.8rem';
+    if (length > 24) fontSize = isEmoji ? '4.3rem' : '4.1rem';
+    if (length > 60) fontSize = isEmoji ? '3.6rem' : '3.3rem';
+    if (length > 110) fontSize = isEmoji ? '2.9rem' : '2.7rem';
+    if (length > 180) fontSize = '2.2rem';
+    if (hasImage && !isEmoji && length > 80) fontSize = '2.4rem';
+
+    const lineHeight = isEmoji ? '1.2' : (length > 120 ? '1.15' : '1.2');
+    const letterSpacing = isEmoji ? (length > 24 ? '0.25rem' : '0.45rem') : 'normal';
+    return `font-size:${fontSize}; line-height:${lineHeight}; letter-spacing:${letterSpacing};`;
+}
+
+function getAdaptiveAnswerStyle(text) {
+    const length = String(text || '').trim().length;
+    let fontSize = '3.6rem';
+    if (length > 40) fontSize = '3rem';
+    if (length > 90) fontSize = '2.4rem';
+    if (length > 150) fontSize = '2rem';
+    return `font-size:${fontSize}; line-height:1.2;`;
+}
+
+function getAdaptiveListGridStyle(items) {
+    const count = Math.max(1, items.length || 1);
+    let minWidth = 220;
+    if (count >= 8) minWidth = 170;
+    if (count >= 12) minWidth = 145;
+    if (count >= 16) minWidth = 125;
+    return `grid-template-columns: repeat(auto-fit, minmax(${minWidth}px, 1fr));`;
+}
+
+function getAdaptiveListItemStyle(item, itemCount) {
+    const length = String(item || '').trim().length;
+    let fontSize = '1.35rem';
+    if (itemCount >= 8) fontSize = '1.15rem';
+    if (itemCount >= 12) fontSize = '1rem';
+    if (length > 22) fontSize = itemCount >= 12 ? '0.92rem' : '1rem';
+    if (length > 36) fontSize = '0.88rem';
+    return `font-size:${fontSize}; line-height:1.2;`;
+}
+
 // Live State (sent over WebRTC)
 let liveState = {
     playedQuestions: [],
@@ -176,9 +601,33 @@ let myPeerId = null;
 let roomCode = '';
 let isHost = false;
 let myPlayerName = '';
+let playerConnectStatus = '';
+let playerConnectTimeout = null;
 
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
+}
+
+function clearPlayerConnectTimeout() {
+    if (playerConnectTimeout) {
+        clearTimeout(playerConnectTimeout);
+        playerConnectTimeout = null;
+    }
+}
+
+function failPlayerConnection(message) {
+    clearPlayerConnectTimeout();
+    if (hostConnection) {
+        try { hostConnection.close(); } catch (e) {}
+    }
+    if (peer) {
+        try { peer.destroy(); } catch (e) {}
+    }
+    hostConnection = null;
+    peer = null;
+    playerConnectStatus = '';
+    alert(message);
+    window.location.hash = '';
 }
 
 function initHostPeer() {
@@ -187,17 +636,24 @@ function initHostPeer() {
     myPeerId = 'jeop-' + roomCode;
     liveState.players = []; // Reset players on new host session
     
-    peer = new Peer(myPeerId);
+    peer = new Peer(myPeerId, { debug: 1 });
     
     peer.on('open', (id) => {
         console.log('Host ready. Room Code:', roomCode);
         render();
     });
 
+    peer.on('error', (err) => {
+        console.error(err);
+        alert('Der Host-Raum konnte nicht gestartet werden. Bitte versuche es erneut.');
+        window.location.hash = '';
+    });
+
     peer.on('connection', (conn) => {
         connections.push(conn);
         conn.on('open', () => {
-            // Wait for JOIN message to get player name
+            conn.send({ type: 'STATE_UPDATE', payload: liveState });
+            render();
         });
         
         conn.on('data', (data) => {
@@ -210,9 +666,18 @@ function initHostPeer() {
                 broadcastState();
                 render();
             }
+            if (data.type === 'REQUEST_SYNC') {
+                conn.send({ type: 'STATE_UPDATE', payload: liveState });
+            }
             if (data.type === 'HL_GUESS') {
                 handleHlGuess(conn.peer, data.guess);
             }
+        });
+
+        conn.on('error', (err) => {
+            console.error('Host connection error:', err);
+            connections = connections.filter(c => c !== conn);
+            render();
         });
 
         conn.on('close', () => {
@@ -230,6 +695,7 @@ function handleHlGuess(playerId, guess) {
     const cat = catList[actQ.catIndex];
     const q = cat.questions[actQ.qIndex];
     const streakIdx = actQ.streakIdx || 0;
+    const streakLen = getQuestionStreakLength(cat, q);
     
     let currentSt = { solution: q.hlSolution };
     if (q.hlStreak && q.hlStreak[streakIdx]) {
@@ -242,13 +708,13 @@ function handleHlGuess(playerId, guess) {
 
     if (isCorrect) {
         if (player) {
-            player.score += Math.floor(actQ.points / (cat.hlStreakLength || 1));
+            player.score += Math.floor(actQ.points / streakLen);
             liveState.stats[playerId].correct++;
         }
         if (conn) conn.send({ type: 'HL_FEEDBACK', correct: true });
         
         // Auto-advance streak
-        if (streakIdx + 1 < (cat.hlStreakLength || 1)) {
+        if (streakIdx + 1 < streakLen) {
             setTimeout(() => {
                 actQ.streakIdx++;
                 broadcastState();
@@ -262,7 +728,7 @@ function handleHlGuess(playerId, guess) {
         }
     } else {
         if (player) {
-            player.score -= Math.floor(actQ.points / (cat.hlStreakLength || 1) / 2);
+            player.score -= Math.floor(actQ.points / streakLen / 2);
             liveState.stats[playerId].wrong++;
         }
         if (conn) conn.send({ type: 'HL_FEEDBACK', correct: false });
@@ -284,14 +750,28 @@ function initPlayerPeer(code, name) {
     isHost = false;
     roomCode = code.toUpperCase();
     myPlayerName = name;
-    peer = new Peer(); 
+    playerConnectStatus = 'Verbinde mit Peer-Netzwerk...';
+    clearPlayerConnectTimeout();
+    peer = new Peer(undefined, { debug: 1 }); 
+    render();
     
     peer.on('open', (id) => {
-        hostConnection = peer.connect('jeop-' + roomCode);
+        playerConnectStatus = `Suche Host ${roomCode}...`;
+        render();
+        hostConnection = peer.connect('jeop-' + roomCode, { reliable: true, serialization: 'json' });
+        clearPlayerConnectTimeout();
+        playerConnectTimeout = setTimeout(() => {
+            if (!hostConnection || !hostConnection.open) {
+                failPlayerConnection(`Keine Verbindung zu Raum ${roomCode}. Prüfe den Code und ob der Host den Raum noch offen hat.`);
+            }
+        }, 10000);
         
         hostConnection.on('open', () => {
+            clearPlayerConnectTimeout();
+            playerConnectStatus = 'Verbunden. Lade Spiel...';
             console.log('Connected to Host');
             hostConnection.send({ type: 'JOIN', name: myPlayerName });
+            hostConnection.send({ type: 'REQUEST_SYNC' });
             render();
         });
         
@@ -299,6 +779,7 @@ function initPlayerPeer(code, name) {
             if (data.type === 'STATE_UPDATE') {
                 liveState = data.payload;
                 activeGame = liveState.gameData; 
+                playerConnectStatus = '';
                 render();
             }
             if (data.type === 'HL_FEEDBACK') {
@@ -306,16 +787,19 @@ function initPlayerPeer(code, name) {
             }
         });
 
+        hostConnection.on('error', (err) => {
+            console.error(err);
+            failPlayerConnection(`Verbindung zu Raum ${roomCode} fehlgeschlagen. Bitte prüfe den Code und versuche es erneut.`);
+        });
+
         hostConnection.on('close', () => {
-            alert('Verbindung zum Host abgebrochen.');
-            window.location.hash = '';
+            failPlayerConnection('Verbindung zum Host abgebrochen.');
         });
     });
 
     peer.on('error', (err) => {
         console.error(err);
-        alert('Verbindung fehlgeschlagen. Ist der Code richtig?');
-        window.location.hash = '';
+        failPlayerConnection('Verbindung fehlgeschlagen. Ist der Code richtig und ist der Host online?');
     });
 }
 
@@ -411,6 +895,21 @@ function renderLauncher(hash = '') {
                     ${games.map(g => `<option value="${g.id}" ${g.id === activeGame.id ? 'selected' : ''}>${g.title}</option>`).join('')}
                 </select>
 
+                <div class="flex-center gap-2 mt-2" style="flex-wrap: wrap;">
+                    <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem 0.75rem;" onclick="createNewGame()">
+                        <i data-lucide="folder-plus"></i> Neuer Bausatz
+                    </button>
+                    <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem 0.75rem;" onclick="renameCurrentGame()">
+                        <i data-lucide="pencil"></i> Umbenennen
+                    </button>
+                    <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem 0.75rem;" onclick="duplicateCurrentGame()">
+                        <i data-lucide="copy"></i> Als Kopie speichern
+                    </button>
+                    <button class="btn btn-danger" style="font-size: 0.8rem; padding: 0.5rem 0.75rem;" onclick="deleteCurrentGame()" ${games.length <= 1 ? 'disabled' : ''}>
+                        <i data-lucide="trash-2"></i> Löschen
+                    </button>
+                </div>
+
                 <div class="flex-center gap-4 mt-4">
                     <button class="btn btn-outline" onclick="window.location.hash = '#editor'">
                         <i data-lucide="edit-3"></i> Editor
@@ -457,11 +956,55 @@ function renderLauncher(hash = '') {
     `;
 
     document.getElementById('game-select').addEventListener('change', (e) => {
-        activeGameId = e.target.value;
-        activeGame = games.find(g => g.id === activeGameId);
-        localStorage.setItem('jeopardy_active_game_v2', activeGameId);
+        setActiveGame(e.target.value);
     });
 }
+
+window.createNewGame = function() {
+    const title = promptForGameTitle(`Bausatz ${games.length + 1}`, 'anzulegen');
+    if (!title) return;
+
+    const newGame = createDefaultGame(title);
+    games.push(newGame);
+    setActiveGame(newGame.id);
+    saveGames();
+    render();
+};
+
+window.renameCurrentGame = function() {
+    const title = promptForGameTitle(activeGame.title, 'umzubenennen');
+    if (!title) return;
+
+    activeGame.title = title;
+    saveGames();
+    render();
+};
+
+window.duplicateCurrentGame = function() {
+    const title = promptForGameTitle(`${activeGame.title} Kopie`, 'als Kopie zu speichern');
+    if (!title) return;
+
+    const newGame = cloneGame(activeGame, title);
+    games.push(newGame);
+    setActiveGame(newGame.id);
+    saveGames();
+    render();
+};
+
+window.deleteCurrentGame = function() {
+    if (games.length <= 1) {
+        alert('Mindestens ein Bausatz muss erhalten bleiben.');
+        return;
+    }
+
+    if (!confirm(`Bausatz "${activeGame.title}" wirklich löschen?`)) return;
+
+    const deleteId = activeGame.id;
+    games = games.filter(g => g.id !== deleteId);
+    setActiveGame(games[0].id);
+    saveGames();
+    render();
+};
 
 window.startHost = function() {
     liveState = { 
@@ -512,9 +1055,11 @@ function renderHostView() {
         const cat = catList[actQ.catIndex];
         const q = cat.questions[actQ.qIndex];
         
-        if (cat.type === 'minigame' && (!cat.minigameType || cat.minigameType === 'higher_lower')) {
+        const questionMode = getQuestionMode(cat, q);
+
+        if (questionMode === 'higher_lower') {
             const streakIdx = actQ.streakIdx || 0;
-            const streakLen = cat.hlStreakLength || 1;
+            const streakLen = getQuestionStreakLength(cat, q);
             
             let currentBase = q.question;
             if (streakIdx > 0 && q.hlStreak && q.hlStreak[streakIdx - 1]) {
@@ -582,8 +1127,156 @@ function renderHostView() {
                     ${answerHtml}
                 </div>
             `;
+        } else if (questionMode === 'list_builder') {
+            const rankedItems = getRankedItems(q);
+            const foundItems = actQ.foundItems || [];
+            const currentPlayer = liveState.players.find(p => p.id === actQ.currentPlayerId);
+            const availablePlayers = liveState.players.filter(p => !actQ.attemptedBy.includes(p.id));
+            const pointsPerItem = getListPointsPerItem(actQ, rankedItems);
+
+            questionDetailHtml = `
+                <div>
+                    <div class="flex-between">
+                        <span class="text-gold font-bold">${cat.name} für ${actQ.points} (Ranking-Liste)</span>
+                        <button class="btn btn-danger" onclick="closeQuestion()">Zurück</button>
+                    </div>
+
+                    <div class="mt-4 p-4" style="background: rgba(255,255,255,0.05); border-radius: 8px;">
+                        <h4 class="text-muted mb-2">Aufgabe</h4>
+                        <p style="font-size: 1.2rem;">${q.question || 'Nenne Einträge aus dieser Rangliste.'}</p>
+                        <p class="text-muted mt-2" style="font-size: 0.9rem;">Punkte pro richtigem Treffer: ${pointsPerItem}</p>
+                    </div>
+
+                    <div class="mt-4 p-4" style="background: rgba(255,255,255,0.05); border-radius: 8px;">
+                        <div class="flex-between mb-2">
+                            <h4 class="text-muted">Host-Rangliste</h4>
+                            <span class="font-bold">${foundItems.length}/${rankedItems.length || 0} gefunden</span>
+                        </div>
+                        <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                            ${rankedItems.map((item, idx) => `
+                                <button class="btn ${foundItems.includes(idx) ? 'btn-gold' : 'btn-outline'}" style="justify-content: flex-start; text-align: left; ${foundItems.includes(idx) ? 'opacity: 0.7;' : ''}" onclick="markListItem(${idx})" ${foundItems.includes(idx) ? 'disabled' : ''}>
+                                    ${idx + 1}. ${item}
+                                </button>
+                            `).join('')}
+                            ${rankedItems.length === 0 ? '<p class="text-muted">Noch keine Rangliste hinterlegt.</p>' : ''}
+                        </div>
+                    </div>
+
+                    <div class="mt-4">
+                        <h4 class="mb-2">Aktueller Zug</h4>
+                        ${currentPlayer ? `
+                            <div class="scoring-player-row">
+                                <span class="font-bold">${currentPlayer.name}</span>
+                                <span class="text-gold">ist dran</span>
+                            </div>
+                        ` : '<p class="text-muted">Wähle zuerst, wer beginnt.</p>'}
+                    </div>
+
+                    <div class="mt-4">
+                        <h4 class="mb-2">Startspieler / Nachziehen</h4>
+                        <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                            ${liveState.players.map((p, pIdx) => `
+                                <button class="btn ${actQ.currentPlayerId === p.id ? 'btn-gold' : 'btn-outline'}" style="justify-content: flex-start;" onclick="setListTurn(${pIdx})" ${actQ.attemptedBy.includes(p.id) && actQ.currentPlayerId !== p.id ? 'disabled' : ''}>
+                                    ${p.name}${actQ.attemptedBy.includes(p.id) && actQ.currentPlayerId !== p.id ? ' (schon raus)' : ''}
+                                </button>
+                            `).join('')}
+                            ${liveState.players.length === 0 ? '<p class="text-muted">Warte auf Spieler...</p>' : ''}
+                        </div>
+                    </div>
+
+                    <div class="mt-4 pt-4" style="border-top: 1px dashed var(--panel-border);">
+                        <div class="flex-center gap-2" style="justify-content: stretch;">
+                            <button class="btn btn-danger w-100" onclick="passListTurn()" ${!currentPlayer ? 'disabled' : ''}>Falsch gesagt / Nachziehen</button>
+                            <button class="btn btn-outline w-100" onclick="showAnswer()">Rangliste aufdecken</button>
+                        </div>
+                        ${actQ.showAnswer ? `
+                            <div class="mt-4 p-4" style="background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); border-radius: 8px;">
+                                <h4 class="mb-2">Komplette Rangliste</h4>
+                                <ol style="padding-left: 1.25rem;">
+                                    ${rankedItems.map(item => `<li>${item}</li>`).join('')}
+                                </ol>
+                            </div>
+                            <div class="mt-4"><button class="btn btn-gold w-100" style="padding: 1rem;" onclick="closeQuestion()">Zurück zum Board</button></div>
+                        ` : ''}
+                        ${!actQ.showAnswer && availablePlayers.length === 0 ? '<p class="text-danger mt-2">Alle Spieler waren dran. Du kannst die Rangliste jetzt aufdecken.</p>' : ''}
+                    </div>
+                </div>
+            `;
+        } else if (questionMode === 'image_question') {
+            const imageQuestionText = getImageQuestionText(cat, q);
+            questionDetailHtml = `
+                <div>
+                    <div class="flex-between">
+                        <span class="text-gold font-bold">${cat.name} fÃ¼r ${actQ.points} (Bildfrage)</span>
+                        <button class="btn btn-danger" onclick="closeQuestion()">ZurÃ¼ck zum Board</button>
+                    </div>
+                    <h2 class="mt-4" style="font-size: 1.5rem;">${imageQuestionText}</h2>
+
+                    <div class="text-center mt-4">
+                        ${q.image ? `
+                            <img src="${q.image}" class="question-image" style="filter: blur(${actQ.blur}px); max-height: 42vh;">
+                            ${actQ.blur > 0 ? `
+                                <div class="mt-2">
+                                    <button class="btn btn-outline" style="padding: 0.5rem;" onclick="reduceBlur()">
+                                        <i data-lucide="eye" style="width:16px;"></i> Bild klarer machen
+                                    </button>
+                                </div>
+                            ` : ''}
+                        ` : `
+                            <div class="p-4" style="border: 1px dashed var(--panel-border); border-radius: 8px;">
+                                <p class="text-muted">Noch keine Bild-URL hinterlegt.</p>
+                                ${q.imageQuery ? `<a class="btn btn-outline mt-2" href="https://www.google.com/search?tbm=isch&q=${encodeURIComponent(q.imageQuery)}" target="_blank">Bild suchen</a>` : ''}
+                            </div>
+                        `}
+                    </div>
+
+                    ${actQ.showAnswer ? `
+                        <div class="mt-4 p-4" style="background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); border-radius: 8px;">
+                            <h3 class="text-success">Antwort:</h3>
+                            <p style="font-size: 1.5rem; font-weight: bold;">${q.answer || '-'}</p>
+                        </div>
+                        <div class="mt-4"><button class="btn btn-gold w-100" style="padding: 1rem;" onclick="closeQuestion()">ZurÃ¼ck zum Board</button></div>
+                    ` : `
+                        <div class="mt-4">
+                            <h4 class="mb-2">Wer hat geantwortet?</h4>
+                            ${liveState.players.length === 0 ? '<p class="text-muted text-center">Warte auf Spieler fÃ¼r Punktevergabe...</p>' : ''}
+                            <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                                ${liveState.players.map((p, pIdx) => {
+                                    const hasAttempted = actQ.attemptedBy.includes(p.id);
+                                    return `
+                                        <div class="scoring-player-row">
+                                            <span class="font-bold">${p.name}</span>
+                                            <div class="flex-center gap-2">
+                                                <button class="btn-wrong" ${hasAttempted ? 'disabled' : ''} onclick="markAttempt(${pIdx}, false)">
+                                                    <i data-lucide="x" style="width:16px;"></i> Falsch
+                                                </button>
+                                                <button class="btn-correct" ${hasAttempted ? 'disabled' : ''} onclick="markAttempt(${pIdx}, true)">
+                                                    <i data-lucide="check" style="width:16px;"></i> Richtig
+                                                </button>
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                        <div class="mt-4 pt-4" style="border-top: 1px dashed var(--panel-border);">
+                            <button class="btn btn-outline w-100" style="padding: 1rem;" onclick="showAnswer()">Antwort aufdecken</button>
+                        </div>
+                    `}
+
+                    <div class="fact-check-box">
+                        <h4 class="flex-between" style="color: var(--magic);">
+                            <span class="flex-center gap-2"><i data-lucide="sparkles"></i> KI Fact-Check</span>
+                            <button class="btn btn-outline" style="padding: 0.25rem 0.75rem; font-size: 0.8rem; border-color: var(--magic); color: var(--magic);" onclick="factCheckAI(${actQ.catIndex}, ${actQ.qIndex})">KI fragen</button>
+                        </h4>
+                        <div id="fact-check-result" class="mt-2 text-muted" style="font-size: 0.9rem;">
+                            Tippe auf KI fragen, um die Antwort Ã¼berprÃ¼fen zu lassen.
+                        </div>
+                    </div>
+                </div>
+            `;
         } else {
-            const isEmoji = cat.type === 'minigame' && cat.minigameType === 'emoji';
+            const isEmoji = questionMode === 'emoji';
             questionDetailHtml = `
                 <div>
                     <div class="flex-between">
@@ -591,19 +1284,6 @@ function renderHostView() {
                         <button class="btn btn-danger" onclick="closeQuestion()">Zurück zum Board</button>
                     </div>
                     <h2 class="mt-4" style="font-size: ${isEmoji ? '4rem' : '1.5rem'}; text-align: ${isEmoji ? 'center' : 'left'}; letter-spacing: ${isEmoji ? '0.5rem' : 'normal'};">${q.question || '<span class="text-muted">[Keine Frage hinterlegt]</span>'}</h2>
-                    
-                    ${q.image ? `
-                        <div class="text-center">
-                            <img src="${q.image}" class="question-image" style="filter: blur(${actQ.blur}px);">
-                            ${actQ.blur > 0 ? `
-                                <div class="mt-2">
-                                    <button class="btn btn-outline" style="padding: 0.5rem;" onclick="reduceBlur()">
-                                        <i data-lucide="eye" style="width:16px;"></i> Bild etwas klarer machen
-                                    </button>
-                                </div>
-                            ` : ''}
-                        </div>
-                    ` : ''}
 
                     ${actQ.showAnswer ? `
                         <div class="mt-4 p-4" style="background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); border-radius: 8px;">
@@ -783,7 +1463,8 @@ window.openQuestion = function(catIndex, qIndex) {
         saveGames();
     }
 
-    let initialBlur = (q.image && q.progressive) ? 40 : 0;
+    const questionMode = getQuestionMode(cat, q);
+    let initialBlur = (questionMode === 'image_question' && q.image && q.progressive !== false) ? 40 : 0;
     const roundMultiplier = round === 2 ? 2 : 1;
     const currentPoints = (qIndex + 1) * (activeGame.pointMultiplier || 100) * roundMultiplier;
     
@@ -796,7 +1477,9 @@ window.openQuestion = function(catIndex, qIndex) {
         attempts: 0, 
         attemptedBy: [], 
         blur: initialBlur, 
-        streakIdx: 0 
+        streakIdx: 0,
+        foundItems: [],
+        currentPlayerId: null
     };
     
     const qKey = `${round}-${catIndex}-${qIndex}`;
@@ -829,6 +1512,71 @@ window.markAttempt = function(pIdx, isCorrect) {
         actQ.attemptedBy.push(player.id);
         logAction(`${player.name} antwortet FALSCH (-${penalty}).`);
     }
+    broadcastState();
+    render();
+}
+
+window.setListTurn = function(pIdx) {
+    const actQ = liveState.activeQuestion;
+    if (!actQ) return;
+
+    const player = liveState.players[pIdx];
+    if (!player) return;
+
+    actQ.currentPlayerId = player.id;
+    logAction(`${player.name} ist jetzt beim Listen-Minispiel dran.`);
+    broadcastState();
+    render();
+}
+
+window.markListItem = function(itemIdx) {
+    const actQ = liveState.activeQuestion;
+    if (!actQ) return;
+
+    const round = actQ.round || 1;
+    const catList = round === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
+    const q = catList[actQ.catIndex]?.questions?.[actQ.qIndex];
+    const rankedItems = q ? getRankedItems(q) : [];
+
+    if (!q || !rankedItems[itemIdx] || !actQ.currentPlayerId) return;
+    if (actQ.foundItems.includes(itemIdx)) return;
+
+    actQ.foundItems.push(itemIdx);
+
+    const player = liveState.players.find(p => p.id === actQ.currentPlayerId);
+    if (player) {
+        const points = getListPointsPerItem(actQ, rankedItems);
+        player.score += points;
+        liveState.stats[player.id].correct++;
+        logAction(`${player.name} nennt korrekt: ${rankedItems[itemIdx]} (+${points}).`);
+    }
+
+    if (actQ.foundItems.length >= rankedItems.length && rankedItems.length > 0) {
+        actQ.showAnswer = true;
+    }
+
+    broadcastState();
+    render();
+}
+
+window.passListTurn = function() {
+    const actQ = liveState.activeQuestion;
+    if (!actQ || !actQ.currentPlayerId) return;
+
+    const currentPlayer = liveState.players.find(p => p.id === actQ.currentPlayerId);
+    if (currentPlayer && !actQ.attemptedBy.includes(currentPlayer.id)) {
+        actQ.attemptedBy.push(currentPlayer.id);
+        liveState.stats[currentPlayer.id].wrong++;
+        logAction(`${currentPlayer.name} liegt falsch. Nächster Spieler darf nachziehen.`);
+    }
+
+    const nextPlayer = liveState.players.find(p => !actQ.attemptedBy.includes(p.id));
+    actQ.currentPlayerId = nextPlayer ? nextPlayer.id : null;
+
+    if (!nextPlayer) {
+        logAction(`Alle Spieler waren dran. Der Host kann die Rangliste jetzt aufdecken.`);
+    }
+
     broadcastState();
     render();
 }
@@ -910,7 +1658,6 @@ window.factCheckAI = async function(cIdx, qIdx) {
     Geplante Antwort: "${q.answer}"
 
 Bitte erkläre kurz in 2-3 Sätzen, ob die geplante Antwort korrekt ist und gib ggf. interessante Zusatzfakten.`;
-
     try {
         let model = localStorage.getItem('jeopardy_gemini_model') || 'gemini-2.5-flash';
         let res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
@@ -970,6 +1717,7 @@ function renderPlayerView() {
             <div class="flex-center" style="height: 100vh; flex-direction: column; gap: 1rem;">
                 <div class="status-indicator yellow" style="width: 20px; height: 20px;"></div>
                 <h3>Verbinde mit Raum ${roomCode}...</h3>
+                <p class="text-muted" style="max-width: 420px; text-align: center;">${playerConnectStatus || 'Bitte kurz warten...'}</p>
             </div>
         `;
         return;
@@ -985,16 +1733,16 @@ function renderPlayerView() {
         const activeCategories = activeRound === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
         const cat = activeCategories[actQ.catIndex];
         const q = cat?.questions?.[actQ.qIndex];
-        
+
         if (!cat || !q) {
             overlayHtml = `
                 <div class="active-question-overlay">
                     <div class="active-question-text">Diese Frage konnte nicht geladen werden.</div>
                 </div>
             `;
-        } else if (cat.type === 'minigame' && (!cat.minigameType || cat.minigameType === 'higher_lower')) {
+        } else if (getQuestionMode(cat, q) === 'higher_lower') {
             const streakIdx = actQ.streakIdx || 0;
-            
+
             let currentBase = q.question;
             if (streakIdx > 0 && q.hlStreak && q.hlStreak[streakIdx - 1]) {
                 currentBase = q.hlStreak[streakIdx - 1].object;
@@ -1007,38 +1755,74 @@ function renderPlayerView() {
 
             overlayHtml = `
                 <div class="active-question-overlay">
-                    <div style="display: flex; flex-direction: column; height: 100%; justify-content: center; gap: 2rem; text-align: center;">
-                        <div style="font-size: 2rem; color: var(--text-muted);">${cat.name} für ${q.points}</div>
-                        <div class="active-question-text" style="font-size: 3rem; margin: 0;">${currentBase || '-'}</div>
-                        
-                        <div style="font-size: 4rem; color: var(--primary); font-weight: bold; background: rgba(0,0,0,0.5); padding: 2rem; border-radius: 16px; border: 4px solid var(--primary);">
+                    <div class="active-question-panel">
+                        <div class="active-question-meta">${cat.name} für ${q.points}</div>
+                        <div class="active-question-text" style="${getAdaptiveQuestionStyle(currentBase || '-')} margin: 0;">${currentBase || '-'}</div>
+                        <div class="active-hl-object" style="${getAdaptiveQuestionStyle(currentSt.object || '-')}">
                             ${currentSt.object || '-'}
                         </div>
-
                         ${!actQ.showAnswer ? `
-                            <div style="display: flex; gap: 2rem; justify-content: center; margin-top: 2rem;">
-                                <button class="btn btn-gold" style="font-size: 2.5rem; padding: 2rem 4rem; border-radius: 20px;" onclick="playerGuessHl('Höher', this)">⬆️ Höher</button>
-                                <button class="btn btn-outline" style="font-size: 2.5rem; padding: 2rem 4rem; border-radius: 20px; border-width: 4px;" onclick="playerGuessHl('Tiefer', this)">⬇️ Tiefer</button>
+                            <div class="active-hl-choice-row">
+                                <button class="btn btn-gold active-hl-choice" onclick="playerGuessHl('Höher', this)">⬆️ Höher</button>
+                                <button class="btn btn-outline active-hl-choice" style="border-width: 4px;" onclick="playerGuessHl('Tiefer', this)">⬇️ Tiefer</button>
                             </div>
                         ` : ''}
-                        
                         ${actQ.showAnswer ? (
-                            '<div style="font-size: 5rem; font-weight: bold; color: ' + (currentSt.solution === 'Höher' ? 'var(--success)' : 'var(--danger)') + '; animation: popIn 0.5s ease-out;">' +
+                            '<div class="active-hl-result" style="color: ' + (currentSt.solution === 'Höher' ? 'var(--success)' : 'var(--danger)') + ';">' +
                                 (currentSt.solution === 'Höher' ? '⬆️ HÖHER' : '⬇️ TIEFER') +
                             '</div>'
                         ) : ''}
                     </div>
                 </div>
             `;
-        } else {
-            const isEmoji = cat.type === 'minigame' && cat.minigameType === 'emoji';
+        } else if (getQuestionMode(cat, q) === 'list_builder') {
+            const rankedItems = getRankedItems(q);
+            const foundItems = actQ.foundItems || [];
+            const currentPlayer = liveState.players.find(p => p.id === actQ.currentPlayerId);
+
             overlayHtml = `
                 <div class="active-question-overlay">
-                    <div class="active-question-text" style="${isEmoji ? 'font-size: 5rem; letter-spacing: 0.5rem; line-height: 1.2;' : ''}">
-                        ${q.question || '...'}
+                    <div class="active-question-panel active-question-panel-top">
+                        <div class="active-question-text" style="${getAdaptiveQuestionStyle(q.question || cat.name)}">${q.question || cat.name}</div>
+                        <div class="text-center text-muted" style="font-size: 1.2rem;">
+                            ${currentPlayer ? `${currentPlayer.name} ist dran` : 'Der Host wählt jetzt den Startspieler'}
+                        </div>
+                        <div class="adaptive-list-grid" style="${getAdaptiveListGridStyle(rankedItems)}">
+                            ${rankedItems.map((item, idx) => `
+                                <div class="adaptive-list-card">
+                                    <div class="text-muted" style="font-size: 0.9rem; margin-bottom: 0.5rem;">Platz ${idx + 1}</div>
+                                    <div style="${getAdaptiveListItemStyle(item, rankedItems.length)} font-weight: bold; color: ${foundItems.includes(idx) ? 'var(--gold)' : '#fff'};">
+                                        ${foundItems.includes(idx) || actQ.showAnswer ? item : '?????'}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
                     </div>
-                    ${q.image ? '<img src="' + q.image + '" class="question-image" style="filter: blur(' + actQ.blur + 'px);">' : ''}
-                    ${actQ.showAnswer ? '<div class="active-answer-text">' + q.answer + '</div>' : ''}
+                </div>
+            `;
+        } else if (getQuestionMode(cat, q) === 'image_question') {
+            const imageQuestionText = getImageQuestionText(cat, q);
+            overlayHtml = `
+                <div class="active-question-overlay">
+                    <div class="active-question-panel">
+                        <div class="active-question-text" style="${getAdaptiveQuestionStyle(imageQuestionText, { hasImage: true })}">
+                            ${imageQuestionText}
+                        </div>
+                        ${q.image ? '<img src="' + q.image + '" class="question-image" style="filter: blur(' + actQ.blur + 'px); max-height: 48vh;">' : '<div class="active-answer-text" style="font-size: 2rem;">Kein Bild hinterlegt</div>'}
+                        ${actQ.showAnswer ? '<div class="active-answer-text" style="' + getAdaptiveAnswerStyle(q.answer || '') + '">' + q.answer + '</div>' : ''}
+                    </div>
+                </div>
+            `;
+        } else {
+            const isEmoji = getQuestionMode(cat, q) === 'emoji';
+            overlayHtml = `
+                <div class="active-question-overlay">
+                    <div class="active-question-panel">
+                        <div class="active-question-text" style="${getAdaptiveQuestionStyle(q.question || '...', { isEmoji, hasImage: !!q.image })}">
+                            ${q.question || '...'}
+                        </div>
+                        ${actQ.showAnswer ? '<div class="active-answer-text" style="' + getAdaptiveAnswerStyle(q.answer || '') + '">' + q.answer + '</div>' : ''}
+                    </div>
                 </div>
             `;
         }
@@ -1096,6 +1880,8 @@ function renderEditor() {
             <div class="flex-between mb-4">
                 <h1 class="title" style="margin: 0; font-size: 2rem;">Editor: ${activeGame.title}</h1>
                 <div class="flex-center gap-2">
+                    <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem;" onclick="renameCurrentGame()">Bausatz umbenennen</button>
+                    <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem;" onclick="duplicateCurrentGame()">Als neuen Bausatz speichern</button>
                     <button class="btn btn-outline" style="font-size: 0.8rem; padding: 0.5rem;" onclick="document.getElementById('settings-modal').style.display='flex'">⚙️ Einstellungen</button>
                     <button class="btn" onclick="window.location.hash = ''">Zurück zum Start</button>
                 </div>
@@ -1113,24 +1899,31 @@ function renderEditor() {
                 ${(window.editorRound === 1 ? activeGame.categories : (activeGame.categoriesRound2 || [])).map((cat, cIdx) => `
                     <div class="category-card">
                         <div class="cat-header">
-                            <input type="text" class="cat-title" value="${cat.name}" onchange="updateCatName(${cIdx}, this.value)" placeholder="Kategoriename">
+                            <input type="text" class="cat-title" value="${cat.name}" oninput="updateCatName(${cIdx}, this.value)" placeholder="Kategoriename">
                             
-                            <div class="flex-between mt-2 mb-2" style="background: rgba(255,255,255,0.05); padding: 0.25rem; border-radius: 6px;">
+                            <div class="flex-between mt-2 mb-2" style="display:none; background: rgba(255,255,255,0.05); padding: 0.25rem; border-radius: 6px;">
                                 <button class="btn ${!cat.type || cat.type === 'standard' ? '' : 'btn-outline'}" style="flex: 1; border: none; font-size: 0.8rem;" onclick="updateCatType(${cIdx}, 'standard')">Standard</button>
                                 <button class="btn ${cat.type === 'minigame' ? '' : 'btn-outline'}" style="flex: 1; border: none; font-size: 0.8rem;" onclick="updateCatType(${cIdx}, 'minigame')">Minispiel</button>
                             </div>
                             
                             ${cat.type === 'minigame' ? `
-                                <div class="mb-2 flex-between gap-2">
+                                <div class="mb-2 flex-between gap-2" style="display:none;">
                                     <select onchange="updateCatMinigameType(${cIdx}, this.value)" class="input-field" style="flex: 2; font-size: 0.85rem; padding: 0.4rem;">
                                         <option value="higher_lower" ${(!cat.minigameType || cat.minigameType === 'higher_lower') ? 'selected' : ''}>Art: Höher / Tiefer</option>
                                         <option value="emoji" ${cat.minigameType === 'emoji' ? 'selected' : ''}>Art: Emoji-Rätsel</option>
+                                        <option value="list_builder" ${cat.minigameType === 'list_builder' ? 'selected' : ''}>Art: Rangliste nennen</option>
                                     </select>
                                     ${(!cat.minigameType || cat.minigameType === 'higher_lower') ? `
                                     <select onchange="updateCatStreak(${cIdx}, parseInt(this.value))" class="input-field" style="flex: 1; font-size: 0.85rem; padding: 0.4rem;" title="Anzahl Vergleiche pro Frage (Streak)">
                                         <option value="1" ${(!cat.hlStreakLength || cat.hlStreakLength === 1) ? 'selected' : ''}>1 Runde</option>
                                         <option value="3" ${cat.hlStreakLength === 3 ? 'selected' : ''}>3 Runden</option>
                                         <option value="5" ${cat.hlStreakLength === 5 ? 'selected' : ''}>5 Runden</option>
+                                    </select>
+                                    ` : cat.minigameType === 'list_builder' ? `
+                                    <select onchange="updateCatListLength(${cIdx}, parseInt(this.value))" class="input-field" style="flex: 1; font-size: 0.85rem; padding: 0.4rem;" title="Anzahl Plätze in der Rangliste">
+                                        <option value="5" ${cat.listLength === 5 ? 'selected' : ''}>Top 5</option>
+                                        <option value="10" ${(!cat.listLength || cat.listLength === 10) ? 'selected' : ''}>Top 10</option>
+                                        <option value="15" ${cat.listLength === 15 ? 'selected' : ''}>Top 15</option>
                                     </select>
                                     ` : ''}
                                 </div>
@@ -1151,8 +1944,10 @@ function renderEditor() {
                             <i data-lucide="loader" class="fa-spin"></i> Generiere...
                         </div>
                         ${cat.questions.map((q, qIdx) => {
-                            if (cat.type === 'minigame' && (!cat.minigameType || cat.minigameType === 'higher_lower')) {
-                                let streakLen = cat.hlStreakLength || 1;
+                            const questionMode = getQuestionMode(cat, q);
+
+                            if (questionMode === 'higher_lower') {
+                                let streakLen = getQuestionStreakLength(cat, q);
                                 if (!q.hlStreak) q.hlStreak = [];
                                 if (q.hlStreak.length === 0 && q.answer) {
                                     q.hlStreak.push({ object: q.answer, solution: q.hlSolution, fact: q.hlFact });
@@ -1166,14 +1961,21 @@ function renderEditor() {
 
                                 return `
                                     <div class="question-item" style="border-left: 3px solid var(--magic);">
+                                        <div class="flex-between gap-2 mb-2">
+                                            <select onchange="updateQuestionType(${cIdx}, ${qIdx}, this.value)" style="flex: 1; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;">
+                                                ${renderQuestionTypeOptions(questionMode)}
+                                            </select>
+                                            <input type="number" min="1" max="7" value="${streakLen}" onchange="updateQuestionStreak(${cIdx}, ${qIdx}, parseInt(this.value || '1'))" style="width: 90px; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;" title="Anzahl Runden">
+                                        </div>
                                         <div class="text-gold font-bold mb-2">${q.points} Pkt (Höher/Tiefer)</div>
-                                        <textarea placeholder="Start-Aussage (Basis) (z.B. Berlin hat 3,6 Mio Einwohner)" rows="2" onchange="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
+                                        <input type="text" placeholder="KI-Thema für diese Frage (optional)" value="${q.aiPrompt || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'aiPrompt', this.value)" style="margin-bottom:0.5rem; color: var(--primary); font-weight: normal;">
+                                        <textarea placeholder="Start-Aussage (Basis) (z.B. Berlin hat 3,6 Mio Einwohner)" rows="2" oninput="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
                                         
                                         <div class="mt-2 text-muted" style="font-size: 0.8rem; font-weight: bold;">Vergleiche (${streakLen}):</div>
                                         ${q.hlStreak.map((st, stIdx) => `
                                             <div style="background: rgba(0,0,0,0.2); padding: 0.5rem; border-radius: 4px; margin-top: 0.5rem;">
                                                 <div style="font-size: 0.75rem; color: var(--primary); margin-bottom: 0.25rem;">Runde ${stIdx + 1}</div>
-                                                <textarea placeholder="Vergleichs-Objekt (z.B. Wie ist es bei München?)" rows="1" onchange="updateStreak(${cIdx}, ${qIdx}, ${stIdx}, 'object', this.value)">${st.object || ''}</textarea>
+                                                <textarea placeholder="Vergleichs-Objekt (z.B. Wie ist es bei München?)" rows="1" oninput="updateStreak(${cIdx}, ${qIdx}, ${stIdx}, 'object', this.value)">${st.object || ''}</textarea>
                                                 <div class="flex-between gap-2 mt-2">
                                                     <select onchange="updateStreak(${cIdx}, ${qIdx}, ${stIdx}, 'solution', this.value)" style="flex: 1; padding: 0.4rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 4px; font-size: 0.85rem;">
                                                         <option value="" disabled ${!st.solution ? 'selected' : ''}>Lösung?</option>
@@ -1181,25 +1983,81 @@ function renderEditor() {
                                                         <option value="Tiefer" ${st.solution === 'Tiefer' ? 'selected' : ''}>⬇️ Tiefer</option>
                                                     </select>
                                                 </div>
-                                                <input type="text" placeholder="Zusatzfakt / Auflösung (z.B. 1,5 Mio)" value="${st.fact || ''}" onchange="updateStreak(${cIdx}, ${qIdx}, ${stIdx}, 'fact', this.value)" style="margin-top:0.5rem; font-size: 0.85rem;">
+                                                <input type="text" placeholder="Zusatzfakt / Auflösung (z.B. 1,5 Mio)" value="${st.fact || ''}" oninput="updateStreak(${cIdx}, ${qIdx}, ${stIdx}, 'fact', this.value)" style="margin-top:0.5rem; font-size: 0.85rem;">
                                             </div>
                                         `).join('')}
-                                        
-                                        <input type="text" placeholder="Bild-URL (optional)..." value="${q.image || ''}" onchange="updateQuestion(${cIdx}, ${qIdx}, 'image', this.value)" style="color: var(--primary); font-weight: normal; font-size: 0.8rem; margin-top: 0.5rem;">
+                                    </div>
+                                `;
+                            } else if (questionMode === 'list_builder') {
+                                const listLength = getQuestionListLength(cat, q);
+                                const listItems = getRankedItems(q);
+                                while (listItems.length < listLength) {
+                                    listItems.push('');
+                                }
+                                if (listItems.length > listLength) {
+                                    listItems.length = listLength;
+                                }
+
+                                return `
+                                    <div class="question-item" style="border-left: 3px solid var(--gold);">
+                                        <div class="flex-between gap-2 mb-2">
+                                            <select onchange="updateQuestionType(${cIdx}, ${qIdx}, this.value)" style="flex: 1; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;">
+                                                ${renderQuestionTypeOptions(questionMode)}
+                                            </select>
+                                            <input type="number" min="3" max="20" value="${listLength}" onchange="updateQuestionListLength(${cIdx}, ${qIdx}, parseInt(this.value || '10'))" style="width: 90px; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;" title="Anzahl Plätze">
+                                        </div>
+                                        <div class="text-gold font-bold mb-2">${q.points} Pkt (Rangliste nennen)</div>
+                                        <input type="text" placeholder="KI-Thema für diese Frage (optional)" value="${q.aiPrompt || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'aiPrompt', this.value)" style="margin-bottom:0.5rem; color: var(--primary); font-weight: normal;">
+                                        <textarea placeholder="Aufgabe (z.B. Nenne die Top-10 Teams der 1. Bundesliga nach Meisterschaften.)" rows="2" oninput="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
+                                        <textarea placeholder="Rangliste, eine Zeile pro Platz" rows="${Math.min(12, listLength + 1)}" oninput="updateListItems(${cIdx}, ${qIdx}, this.value)">${listItems.join('\n')}</textarea>
+                                        <div class="text-muted mt-2" style="font-size: 0.8rem;">Zeile 1 = Platz 1, Zeile 2 = Platz 2 usw.</div>
+                                    </div>
+                                `;
+                            } else if (questionMode === 'image_question') {
+                                return `
+                                    <div class="question-item" style="border-left: 3px solid var(--primary);">
+                                        <div class="flex-between gap-2 mb-2">
+                                            <select onchange="updateQuestionType(${cIdx}, ${qIdx}, this.value)" style="flex: 1; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;">
+                                                ${renderQuestionTypeOptions(questionMode)}
+                                            </select>
+                                        </div>
+                                        <div class="text-gold font-bold mb-2">${q.points} Pkt (Bildfrage)</div>
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem;">KI-Thema / Bildidee</div>
+                                        <input type="text" placeholder="z.B. Flaggen Europas, Sportwagen, Film-Logos" value="${q.aiPrompt || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'aiPrompt', this.value)" style="margin-bottom:0.5rem; color: var(--primary); font-weight: normal;">
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem;">Frage</div>
+                                        <textarea placeholder="z.B. Welches Land hat diese Flagge?" rows="2" oninput="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin: 0.25rem 0;">Antwort</div>
+                                        <input type="text" placeholder="Richtige LÃ¶sung" value="${q.answer || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'answer', this.value)">
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin: 0.25rem 0;">Bild-URL</div>
+                                        <input type="text" placeholder="Direkte Bild-URL einfÃ¼gen..." value="${q.image || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'image', this.value)" style="color: var(--primary); font-weight: normal; font-size: 0.8rem; margin-top: 0.5rem;">
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin: 0.25rem 0;">Bildsuche</div>
+                                        <input type="text" placeholder="Suchbegriff, falls KI keinen direkten Link findet" value="${q.imageQuery || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'imageQuery', this.value)" style="color: var(--primary); font-weight: normal; font-size: 0.8rem; margin-top: 0.5rem;">
+                                        <button class="btn btn-outline w-100 mt-2" style="font-size: 0.8rem; padding: 0.5rem;" onclick="findImageForQuestion(${cIdx}, ${qIdx})">
+                                            <i data-lucide="image"></i> Bild automatisch suchen
+                                        </button>
+                                        ${q.imageQuery ? `<a class="btn btn-outline w-100 mt-2" href="https://www.google.com/search?tbm=isch&q=${encodeURIComponent(q.imageQuery)}" target="_blank">Bild suchen</a>` : ''}
+                                        <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; cursor: pointer;">
+                                            <input type="checkbox" ${q.progressive !== false ? 'checked' : ''} onchange="updateQuestion(${cIdx}, ${qIdx}, 'progressive', this.checked)">
+                                            Bild verpixelt starten
+                                        </label>
                                     </div>
                                 `;
                             } else {
-                                const isEmoji = cat.type === 'minigame' && cat.minigameType === 'emoji';
+                                const isEmoji = questionMode === 'emoji';
                                 return `
                                     <div class="question-item">
+                                        <div class="flex-between gap-2 mb-2">
+                                            <select onchange="updateQuestionType(${cIdx}, ${qIdx}, this.value)" style="flex: 1; padding: 0.45rem; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 6px;">
+                                                ${renderQuestionTypeOptions(questionMode)}
+                                            </select>
+                                        </div>
                                         <div class="text-gold font-bold mb-2">${q.points} Pkt ${isEmoji ? '(Emoji-Rätsel)' : ''}</div>
-                                        <textarea placeholder="${isEmoji ? 'Tippe Emojis ein (z.B. 🚢🧊🥶)' : 'Tippe hier die Frage ein...'}" rows="2" onchange="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
-                                        <input type="text" placeholder="${isEmoji ? 'Lösung (z.B. Titanic)' : 'Tippe hier die Antwort ein...'}" value="${q.answer || ''}" onchange="updateQuestion(${cIdx}, ${qIdx}, 'answer', this.value)">
-                                        <input type="text" placeholder="Bild-URL (optional)..." value="${q.image || ''}" onchange="updateQuestion(${cIdx}, ${qIdx}, 'image', this.value)" style="color: var(--primary); font-weight: normal; font-size: 0.8rem; margin-top: 0.5rem;">
-                                        <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; cursor: pointer;">
-                                            <input type="checkbox" ${q.progressive ? 'checked' : ''} onchange="updateQuestion(${cIdx}, ${qIdx}, 'progressive', this.checked)">
-                                            Bild schrittweise aufdecken (Progressive Reveal)
-                                        </label>
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem;">KI-Thema</div>
+                                        <input type="text" placeholder="KI-Thema für diese Frage (optional)" value="${q.aiPrompt || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'aiPrompt', this.value)" style="margin-bottom:0.5rem; color: var(--primary); font-weight: normal;">
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin-bottom: 0.25rem;">${isEmoji ? 'Emoji-Frage' : 'Frage'}</div>
+                                        <textarea placeholder="${isEmoji ? 'Tippe Emojis ein (z.B. 🚢🧊🥶)' : 'Tippe hier die Frage ein...'}" rows="2" oninput="updateQuestion(${cIdx}, ${qIdx}, 'question', this.value)">${q.question || ''}</textarea>
+                                        <div class="text-muted" style="font-size: 0.75rem; font-weight: bold; margin: 0.25rem 0;">${isEmoji ? 'Lösung' : 'Antwort'}</div>
+                                        <input type="text" placeholder="${isEmoji ? 'Lösung (z.B. Titanic)' : 'Tippe hier die Antwort ein...'}" value="${q.answer || ''}" oninput="updateQuestion(${cIdx}, ${qIdx}, 'answer', this.value)">
                                     </div>
                                 `;
                             }
@@ -1296,7 +2154,7 @@ window.updateCatType = function(cIdx, type) {
     if (!cat && round === 2) { initRound2(); cat = activeGame.categoriesRound2[cIdx]; }
     
     cat.type = type;
-    if (type === 'minigame') cat.minigameType = 'higher_lower';
+    if (type === 'minigame' && !cat.minigameType) cat.minigameType = 'higher_lower';
     saveGames();
     render();
 }
@@ -1309,10 +2167,56 @@ window.updateCatMinigameType = function(cIdx, minigameType) {
     render();
 }
 
+window.updateQuestionType = function(cIdx, qIdx, questionType) {
+    const round = window.editorRound || 1;
+    const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    const q = cat.questions[qIdx];
+    q.questionType = questionType;
+    if (questionType === 'image_question' && q.progressive === undefined) {
+        q.progressive = true;
+    }
+    saveGames();
+    render();
+}
+
 window.updateCatStreak = function(cIdx, len) {
     const round = window.editorRound || 1;
     let cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
     cat.hlStreakLength = len;
+    saveGames();
+    render();
+}
+
+window.updateQuestionStreak = function(cIdx, qIdx, len) {
+    const round = window.editorRound || 1;
+    const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    const q = cat.questions[qIdx];
+    q.hlStreakLength = Math.max(1, len || 1);
+    saveGames();
+    render();
+}
+
+window.updateCatListLength = function(cIdx, len) {
+    const round = window.editorRound || 1;
+    let cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    cat.listLength = len;
+    cat.questions.forEach(q => {
+        const items = getRankedItems(q);
+        while (items.length < len) items.push('');
+        if (items.length > len) items.length = len;
+    });
+    saveGames();
+    render();
+}
+
+window.updateQuestionListLength = function(cIdx, qIdx, len) {
+    const round = window.editorRound || 1;
+    const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    const q = cat.questions[qIdx];
+    q.listLength = Math.max(3, len || 10);
+    const items = getRankedItems(q);
+    while (items.length < q.listLength) items.push('');
+    if (items.length > q.listLength) items.length = q.listLength;
     saveGames();
     render();
 }
@@ -1334,6 +2238,26 @@ window.updateQuestion = function(cIdx, qIdx, field, val) {
     saveGames();
 }
 
+window.findImageForQuestion = async function(cIdx, qIdx) {
+    const round = window.editorRound || 1;
+    const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    const q = cat?.questions?.[qIdx];
+    if (!q) return;
+
+    const previousImage = q.image;
+    q.image = '';
+    saveGames();
+
+    const found = await autoFillQuestionImage(q, cat);
+    if (!found) {
+        q.image = previousImage || '';
+        alert('Kein passendes Bild gefunden. Versuch einen genaueren Bildsuchbegriff.');
+    }
+
+    saveGames();
+    render();
+}
+
 window.updateStreak = function(cIdx, qIdx, stIdx, field, val) {
     const round = window.editorRound || 1;
     const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
@@ -1342,6 +2266,14 @@ window.updateStreak = function(cIdx, qIdx, stIdx, field, val) {
     if (!q.hlStreak) q.hlStreak = [];
     if (!q.hlStreak[stIdx]) q.hlStreak[stIdx] = { object: '', solution: '', fact: '' };
     q.hlStreak[stIdx][field] = val;
+    saveGames();
+}
+
+window.updateListItems = function(cIdx, qIdx, val) {
+    const round = window.editorRound || 1;
+    const cat = round === 1 ? activeGame.categories[cIdx] : activeGame.categoriesRound2[cIdx];
+    const q = cat.questions[qIdx];
+    q.listItems = val.split('\n').map(item => item.trim());
     saveGames();
 }
 
@@ -1436,15 +2368,98 @@ async function generateCategoryWithAI(cIdx, apiKey) {
     render();
     document.getElementById(`ai-status-${cIdx}`).style.display = 'block';
 
-    const isMinigame = cat.type === 'minigame';
-    const minigameType = cat.minigameType;
     const qCount = activeGame.questionsPerCategory || 5;
     const mult = activeGame.pointMultiplier || 100;
+    const isMinigame = cat.type === 'minigame';
+    const minigameType = cat.minigameType;
     const streakLen = cat.hlStreakLength || 1;
-
     let pointsDesc = Array.from({length: qCount}, (_, i) => (i+1)*mult).join(', ');
+    const slotSpecs = cat.questions.slice(0, qCount).map((q, idx) => ({
+        idx,
+        mode: getQuestionMode(cat, q),
+        topic: getQuestionAiTopic(cat, q),
+        points: (idx + 1) * mult,
+        difficultyRank: qCount === 1 ? 1 : Math.round((idx / Math.max(1, qCount - 1)) * 4) + 1,
+        streakLen: getQuestionStreakLength(cat, q),
+        listLength: getQuestionListLength(cat, q)
+    }));
 
-    let prompt = '';
+    const specText = slotSpecs.map(spec => {
+        const currentQuestion = cat.questions[spec.idx];
+        const state = getQuestionContentState(cat, currentQuestion);
+        const questionNote = state.hasQuestion
+            ? `Vorhandene Frage NICHT überschreiben: ${JSON.stringify(state.questionText)}`
+            : 'Frage darf neu erzeugt werden.';
+        let fillNote = 'Fehlende Inhalte ergänzen.';
+
+        if (state.mode === 'higher_lower') {
+            fillNote = state.hasQuestion
+                ? `Nur hlStreak ergänzen. Bereits gefüllte Teile beibehalten. Vorhanden: ${state.filledItems}/${state.expectedItems}.`
+                : `Question und hlStreak erzeugen. Bereits gefüllte Teile beibehalten. Vorhanden: ${state.filledItems}/${state.expectedItems}.`;
+            return `Slot ${spec.idx + 1}: mode=higher_lower, topic="${spec.topic}", points=${spec.points}, streakLen=${spec.streakLen}. ${questionNote} ${fillNote}`;
+        }
+
+        if (state.mode === 'list_builder') {
+            fillNote = state.hasQuestion
+                ? `Nur listItems ergänzen. Bereits gefüllte Plätze beibehalten. Vorhanden: ${state.filledItems}/${state.expectedItems}.`
+                : `Question und listItems erzeugen. Bereits gefüllte Plätze beibehalten. Vorhanden: ${state.filledItems}/${state.expectedItems}.`;
+            return `Slot ${spec.idx + 1}: mode=list_builder, topic="${spec.topic}", points=${spec.points}, listLength=${spec.listLength}. ${questionNote} ${fillNote}`;
+        }
+
+        if (state.mode === 'image_question') {
+            fillNote = state.hasQuestion
+                ? `Nur answer, imageQuery und optional image ergänzen. Bereits vorhandene Frage, Antwort oder Bild-URL beibehalten. Answer aktuell ${state.hasAnswer ? 'vorhanden' : 'leer'}, Bild aktuell ${state.hasImage ? 'vorhanden' : 'leer'}.`
+                : 'Question, answer, imageQuery und optional image erzeugen, aber nichts Vorhandenes überschreiben.';
+            return `Slot ${spec.idx + 1}: mode=image_question, topic="${spec.topic}", points=${spec.points}, difficultyRank=${spec.difficultyRank}/5. ${questionNote} ${fillNote}`;
+        }
+
+        if (state.mode === 'emoji') {
+            fillNote = state.hasQuestion
+                ? `Nur answer ergänzen. Bereits vorhandene Frage beibehalten. Answer aktuell ${state.hasAnswer ? 'vorhanden' : 'leer'}.`
+                : 'Question und answer erzeugen, aber nichts Vorhandenes überschreiben.';
+            return `Slot ${spec.idx + 1}: mode=emoji, topic="${spec.topic}", points=${spec.points}. ${questionNote} ${fillNote}`;
+        }
+
+        fillNote = state.hasQuestion
+            ? `Nur answer ergänzen. Bereits vorhandene Frage beibehalten. Answer aktuell ${state.hasAnswer ? 'vorhanden' : 'leer'}.`
+            : 'Question und answer erzeugen, aber nichts Vorhandenes überschreiben.';
+        return `Slot ${spec.idx + 1}: mode=standard, topic="${spec.topic}", points=${spec.points}. ${questionNote} ${fillNote}`;
+    }).join('\n');
+
+    const mixedPrompt = `Erstelle genau ${qCount} Jeopardy-Einträge für die Kategorie "${catName}". Schwierigkeit: "${difficulty}".
+
+WICHTIG:
+- Antworte AUSSCHLIESSLICH mit einem JSON-Array mit genau ${qCount} Einträgen.
+- Jeder Array-Eintrag gehört genau zu einem Slot unten.
+- Berücksichtige beim jeweiligen Slot IMMER den angegebenen mode und das angegebene topic.
+- topic darf genauer sein als der Kategoriename und hat Vorrang.
+
+Slots:
+${specText}
+
+Regeln pro mode:
+- standard: {"question":"Frage","answer":"Antwort"}
+- image_question: {"question":"Bildfrage","answer":"Lösung","imageQuery":"präziser Wikimedia-Commons-Bildsuchbegriff","image":""}
+- emoji: {"question":"nur Emojis","answer":"Lösung"}
+- higher_lower: {"question":"Basis-Aussage mit Zahl","hlStreak":[{"object":"Objekt","solution":"Höher oder Tiefer","fact":"Zusatzfakt"}]}
+- list_builder: {"question":"Nenne ...","listItems":["Platz 1","Platz 2"]}
+
+Zusatzregeln:
+- Bei standard und emoji gilt: "question" ist immer das, was den Spielern angezeigt wird. "answer" ist immer die richtige Lösung.
+- Bei image_question gilt: "question" ist die Textfrage zum Bild, "answer" ist das gesuchte Objekt/Land/Auto/etc. Beschreibe das Bild nicht als Textlösung. imageQuery muss ein konkreter Suchbegriff sein, mit dem Wikimedia Commons genau dieses Bild finden kann, z.B. "Flag of Brazil", "BMW E30 Wikimedia Commons" oder "Eiffel Tower Paris Wikimedia Commons". Lasse image leer, die App sucht das Bild danach automatisch.
+- Bei Flaggen-Bildfragen darf "question" NIEMALS die Farben, Muster, Symbole oder Form der Flagge beschreiben. Nutze nur eine neutrale Frage wie "Welche Flagge ist das?" und setze die Lösung in "answer".
+- Bei Flaggen-Bildfragen müssen die Punkte schwerer werden: difficultyRank 1 = sehr bekannte Flaggen/Länder, 2 = bekannte Länder, 3 = mittelbekannte Länder, 4 = schwierige Länder/kleinere Staaten, 5 = sehr schwere/seltene Länder oder Territorien. Verwende keine doppelte Lösung in derselben Kategorie.
+- Bei Flaggen-Bildfragen muss imageQuery exakt im Format "Flag of <englischer Landesname>" sein, damit die App die richtige Commons-Datei suchen kann.
+- Bildfragen eignen sich besonders für Flaggen, Autos, Logos, Karten, Personen, Tiere, Orte und Gegenstände.
+- Verwende NICHT das amerikanische Jeopardy-TV-Prinzip mit vertauschten Rollen. Frage und Antwort dürfen niemals vertauscht sein.
+- Wenn bei einem Slot bereits eine question vorgegeben ist, darfst du diese question nicht neu formulieren oder ändern.
+- Fülle in diesem Fall nur die fehlenden Inhalte für diesen Slot aus.
+- Wenn answer, hlStreak-Einträge oder listItems schon teilweise vorgegeben sind, liefere trotzdem das vollständige Format zurück, aber überschreibe semantisch nichts Vorhandenes.
+- higher_lower: keine Fragen formulieren, sondern reine Fakten-Aussagen; hlStreak muss genau die angegebene streakLen haben.
+- list_builder: listItems muss genau die angegebene listLength haben.
+- emoji: question darf nur aus Emojis bestehen.
+- standard: kurze spielbare Jeopardy-Frage mit Antwort.`;
+    let prompt = mixedPrompt;
     if (isMinigame && minigameType === 'higher_lower') {
         if (streakLen > 1) {
             prompt = `Erstelle ${qCount} zusammenhängende "Höher oder Tiefer"-Ketten zum Thema "${catName}". Die Schwierigkeit soll über die ${qCount} Ketten ansteigen (${pointsDesc} Punkte). 
@@ -1487,9 +2502,23 @@ WICHTIG:
 - "question" darf AUSSCHLIESSLICH aus Emojis bestehen (z.B. "🚢🧊👩‍❤️‍👨🥶🚪"). Verwende keine Buchstaben, Wörter oder Satzzeichen in der "question".
 - "answer" ist die dazugehörige Lösung (z.B. "Titanic").
 Antworte AUSSCHLIESSLICH mit einem JSON-Array, ohne Markdown: [{"question": "Emojis hier...", "answer": "Die Lösung hier..."}, ...]`;
+    } else if (isMinigame && minigameType === 'list_builder') {
+        const listLength = cat.listLength || 10;
+        prompt = `Erstelle genau ${qCount} Jeopardy-Minispiele für die Kategorie "${catName}". Jedes Minispiel ist eine Rangliste mit genau ${listLength} Einträgen, die Spieler nacheinander nennen müssen. Die Schwierigkeit soll ansteigen (${pointsDesc} Punkte). Schwierigkeit: "${difficulty}".
+
+WICHTIG:
+- "question" ist die Aufgabenstellung, z.B. "Nenne die Top 10..."
+- "listItems" ist die fertige Rangliste in korrekter Reihenfolge von Platz 1 bis Platz ${listLength}
+- Jeder Eintrag in "listItems" muss kurz und eindeutig sein
+- Antworte AUSSCHLIESSLICH mit JSON, ohne Markdown
+
+Format:
+[{"question":"Nenne ...","listItems":["Platz 1","Platz 2","Platz 3"]}]`;
     } else {
         prompt = `Erstelle genau ${qCount} Jeopardy Fragen für die Kategorie "${catName}". Die Fragen müssen im Schwierigkeitsgrad von leicht bis schwer (${pointsDesc} Punkte) ansteigen. Schwierigkeit: "${difficulty}". Antworte AUSSCHLIESSLICH mit einem JSON-Array, ohne Markdown: [{"question": "Die Frage hier...", "answer": "Die Antwort hier..."}, ...]`;
     }
+
+    prompt = mixedPrompt;
 
     try {
         let modelName = localStorage.getItem('jeopardy_gemini_model') || 'gemini-2.5-flash';
@@ -1552,18 +2581,15 @@ Antworte AUSSCHLIESSLICH mit einem JSON-Array, ohne Markdown: [{"question": "Emo
         
         if (Array.isArray(parsed) && parsed.length >= qCount) {
             for (let i = 0; i < qCount; i++) {
-                targetList[i].question = parsed[i].question || '';
-                
-                if (isMinigame && minigameType === 'higher_lower') {
-                    if (parsed[i].hlStreak && Array.isArray(parsed[i].hlStreak)) {
-                        targetList[i].hlStreak = parsed[i].hlStreak.map(s => {
-                            let sol = s.solution || s.hlSolution || 'Höher';
-                            if (!['Höher', 'Tiefer'].includes(sol)) sol = 'Höher';
-                            return { object: s.object || '', solution: sol, fact: s.fact || s.hlFact || '' };
-                        });
+                applyAiSlotData(targetCat, targetList[i], parsed[i] || {});
+            }
+
+            for (let i = 0; i < qCount; i++) {
+                if (getQuestionMode(targetCat, targetList[i]) === 'image_question') {
+                    if (isFlagImageQuestion(targetCat, targetList[i])) {
+                        targetList[i].image = '';
                     }
-                } else {
-                    targetList[i].answer = parsed[i].answer || '';
+                    await autoFillQuestionImage(targetList[i], targetCat);
                 }
             }
             saveGames();
