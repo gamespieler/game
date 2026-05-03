@@ -604,8 +604,52 @@ let myPlayerName = '';
 let playerConnectStatus = '';
 let playerConnectTimeout = null;
 
+const PEER_OPTIONS = {
+    debug: 1,
+    secure: true,
+    host: '0.peerjs.com',
+    port: 443,
+    path: '/',
+    config: {
+        iceCandidatePoolSize: 10,
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun.cloudflare.com:3478' },
+            { urls: 'stun:openrelay.metered.ca:80' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ]
+    }
+};
+
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
+}
+
+function isInAppBrowser() {
+    const ua = navigator.userAgent || '';
+    return /WhatsApp|FBAN|FBAV|Instagram|Line|TikTok|Snapchat/i.test(ua);
+}
+
+function getConnectionHelpText() {
+    if (isInAppBrowser()) {
+        return 'Du bist vermutlich im WhatsApp-Browser. Öffne den Link über das Menü in Safari/Chrome, sonst blockiert WhatsApp oft die Online-Verbindung.';
+    }
+    return 'Prüfe den Code, ob der Host-Tab noch offen ist und ob das Host-Gerät nicht gesperrt wurde. Wenn es weiter hängt, testet kurz beide Geräte im gleichen WLAN.';
 }
 
 function clearPlayerConnectTimeout() {
@@ -626,7 +670,7 @@ function failPlayerConnection(message) {
     hostConnection = null;
     peer = null;
     playerConnectStatus = '';
-    alert(message);
+    alert(`${message}\n\n${getConnectionHelpText()}`);
     window.location.hash = '';
 }
 
@@ -636,7 +680,7 @@ function initHostPeer() {
     myPeerId = 'jeop-' + roomCode;
     liveState.players = []; // Reset players on new host session
     
-    peer = new Peer(myPeerId, { debug: 1 });
+    peer = new Peer(myPeerId, PEER_OPTIONS);
     
     peer.on('open', (id) => {
         console.log('Host ready. Room Code:', roomCode);
@@ -645,8 +689,14 @@ function initHostPeer() {
 
     peer.on('error', (err) => {
         console.error(err);
-        alert('Der Host-Raum konnte nicht gestartet werden. Bitte versuche es erneut.');
+        alert(`Der Host-Raum konnte nicht gestartet werden.\n\nFehler: ${err.type || err.message || 'unbekannt'}`);
         window.location.hash = '';
+    });
+
+    peer.on('disconnected', () => {
+        logAction('PeerJS-Signaling getrennt. Versuche neu zu verbinden.');
+        try { peer.reconnect(); } catch (e) {}
+        render();
     });
 
     peer.on('connection', (conn) => {
@@ -750,9 +800,11 @@ function initPlayerPeer(code, name) {
     isHost = false;
     roomCode = code.toUpperCase();
     myPlayerName = name;
-    playerConnectStatus = 'Verbinde mit Peer-Netzwerk...';
+    playerConnectStatus = isInAppBrowser()
+        ? 'WhatsApp-Browser erkannt. Bitte in Safari/Chrome öffnen, falls es nicht verbindet.'
+        : 'Verbinde mit Peer-Netzwerk...';
     clearPlayerConnectTimeout();
-    peer = new Peer(undefined, { debug: 1 }); 
+    peer = new Peer(undefined, PEER_OPTIONS); 
     render();
     
     peer.on('open', (id) => {
@@ -762,9 +814,9 @@ function initPlayerPeer(code, name) {
         clearPlayerConnectTimeout();
         playerConnectTimeout = setTimeout(() => {
             if (!hostConnection || !hostConnection.open) {
-                failPlayerConnection(`Keine Verbindung zu Raum ${roomCode}. Prüfe den Code und ob der Host den Raum noch offen hat.`);
+                failPlayerConnection(`Keine Verbindung zu Raum ${roomCode}.`);
             }
-        }, 10000);
+        }, 25000);
         
         hostConnection.on('open', () => {
             clearPlayerConnectTimeout();
@@ -789,7 +841,7 @@ function initPlayerPeer(code, name) {
 
         hostConnection.on('error', (err) => {
             console.error(err);
-            failPlayerConnection(`Verbindung zu Raum ${roomCode} fehlgeschlagen. Bitte prüfe den Code und versuche es erneut.`);
+            failPlayerConnection(`Verbindung zu Raum ${roomCode} fehlgeschlagen. Fehler: ${err.type || err.message || 'unbekannt'}`);
         });
 
         hostConnection.on('close', () => {
@@ -799,7 +851,13 @@ function initPlayerPeer(code, name) {
 
     peer.on('error', (err) => {
         console.error(err);
-        failPlayerConnection('Verbindung fehlgeschlagen. Ist der Code richtig und ist der Host online?');
+        failPlayerConnection(`Verbindung fehlgeschlagen. Fehler: ${err.type || err.message || 'unbekannt'}`);
+    });
+
+    peer.on('disconnected', () => {
+        playerConnectStatus = 'Signaling getrennt. Versuche neu zu verbinden...';
+        try { peer.reconnect(); } catch (e) {}
+        render();
     });
 }
 
@@ -1035,6 +1093,9 @@ window.joinGame = function() {
     
     if (!name) return alert("Bitte gib einen Namen ein.");
     if (code.length !== 4) return alert("Bitte einen 4-stelligen Code eingeben.");
+    if (isInAppBrowser()) {
+        alert('Du öffnest die App gerade im WhatsApp-Browser. Wenn die Verbindung nicht klappt: Menü oben/rechts öffnen und "In Safari öffnen" oder "In Chrome öffnen" wählen. Danach denselben Raumcode eingeben.');
+    }
     
     window.location.hash = '#player';
     initPlayerPeer(code, name);
@@ -1718,6 +1779,12 @@ function renderPlayerView() {
                 <div class="status-indicator yellow" style="width: 20px; height: 20px;"></div>
                 <h3>Verbinde mit Raum ${roomCode}...</h3>
                 <p class="text-muted" style="max-width: 420px; text-align: center;">${playerConnectStatus || 'Bitte kurz warten...'}</p>
+                ${isInAppBrowser() ? `
+                    <div style="max-width: 420px; text-align: center; background: rgba(251,191,36,0.1); border: 1px solid var(--gold); border-radius: 8px; padding: 1rem;">
+                        <strong class="text-gold">WhatsApp-Browser erkannt</strong>
+                        <p class="text-muted mt-1" style="font-size: 0.9rem;">Öffne diese Seite über das Menü in Safari/Chrome und gib den Raumcode nochmal ein.</p>
+                    </div>
+                ` : ''}
             </div>
         `;
         return;
