@@ -218,6 +218,32 @@ function getListPointsPerItem(actQ, items) {
     return Math.max(1, Math.floor((actQ.points || 0) / Math.max(1, items.length)));
 }
 
+function getQuestionKey(actQ) {
+    if (!actQ) return '';
+    return `${actQ.round || 1}-${actQ.catIndex}-${actQ.qIndex}`;
+}
+
+function markActiveQuestionPlayed() {
+    const qKey = getQuestionKey(liveState.activeQuestion);
+    if (qKey && !liveState.playedQuestions.includes(qKey)) {
+        liveState.playedQuestions.push(qKey);
+    }
+}
+
+function getRoundCategories(round = 1) {
+    if (round === 1) return Array.isArray(activeGame.categories) ? activeGame.categories : [];
+    return Array.isArray(activeGame.categoriesRound2) ? activeGame.categoriesRound2 : [];
+}
+
+function getSafeCategory(round, catIndex) {
+    return getRoundCategories(round)[catIndex] || null;
+}
+
+function getSafeQuestion(round, catIndex, qIndex) {
+    const cat = getSafeCategory(round, catIndex);
+    return cat?.questions?.[qIndex] || null;
+}
+
 function hasMeaningfulText(value) {
     return typeof value === 'string' && value.trim().length > 0;
 }
@@ -727,10 +753,11 @@ function initHostPeer() {
 function handleHlGuess(playerId, guess) {
     if (!liveState.activeQuestion) return;
     const actQ = liveState.activeQuestion;
+    if (actQ.hlAdvancing || actQ.showAnswer) return;
     const round = actQ.round || 1;
-    const catList = round === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
-    const cat = catList[actQ.catIndex];
-    const q = cat.questions[actQ.qIndex];
+    const cat = getSafeCategory(round, actQ.catIndex);
+    const q = getSafeQuestion(round, actQ.catIndex, actQ.qIndex);
+    if (!cat || !q) return;
     const streakIdx = actQ.streakIdx || 0;
     const streakLen = getQuestionStreakLength(cat, q);
     
@@ -749,38 +776,38 @@ function handleHlGuess(playerId, guess) {
             liveState.stats[playerId].correct++;
         }
         if (conn) conn.send({ type: 'HL_FEEDBACK', correct: true });
-        
-        // Auto-advance streak
-        if (streakIdx + 1 < streakLen) {
-            setTimeout(() => {
-                actQ.streakIdx++;
-                broadcastState();
-                render();
-            }, 1000);
-        } else {
-            // End of streak
-            actQ.showAnswer = true;
-            broadcastState();
-            render();
-        }
+        scheduleHigherLowerAdvance(actQ, streakIdx, streakLen);
     } else {
         if (player) {
             player.score -= Math.floor(actQ.points / streakLen / 2);
             liveState.stats[playerId].wrong++;
         }
         if (conn) conn.send({ type: 'HL_FEEDBACK', correct: false });
-        
-        // Block player from guessing again for 1.5 seconds on wrong answer
-        if (!liveState.hlBlockedPlayers) liveState.hlBlockedPlayers = [];
-        liveState.hlBlockedPlayers.push(playerId);
-        setTimeout(() => {
-            liveState.hlBlockedPlayers = liveState.hlBlockedPlayers.filter(id => id !== playerId);
-            broadcastState();
-        }, 1500);
+        scheduleHigherLowerAdvance(actQ, streakIdx, streakLen);
     }
     
     broadcastState();
     render();
+}
+
+function scheduleHigherLowerAdvance(actQ, streakIdx, streakLen) {
+    actQ.hlAdvancing = true;
+
+    setTimeout(() => {
+        if (liveState.activeQuestion !== actQ) return;
+
+        if (streakIdx + 1 < streakLen) {
+            actQ.streakIdx = streakIdx + 1;
+            actQ.showAnswer = false;
+        } else {
+            actQ.showAnswer = true;
+            markActiveQuestionPlayed();
+        }
+
+        actQ.hlAdvancing = false;
+        broadcastState();
+        render();
+    }, 1000);
 }
 
 function initPlayerPeer(code, name) {
@@ -1068,6 +1095,7 @@ window.startHost = function() {
 
 window.setRound = function(r) {
     if(!isHost) return;
+    liveState.activeQuestion = null;
     liveState.currentRound = r;
     logAction(`Runde ${r} gestartet.`);
     broadcastState();
@@ -1099,13 +1127,18 @@ function renderHostView() {
     
     if (actQ) {
         const round = actQ.round || 1;
-        const catList = round === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
-        const cat = catList[actQ.catIndex];
-        const q = cat.questions[actQ.qIndex];
-        
-        const questionMode = getQuestionMode(cat, q);
+        const cat = getSafeCategory(round, actQ.catIndex);
+        const q = getSafeQuestion(round, actQ.catIndex, actQ.qIndex);
+        const questionMode = cat && q ? getQuestionMode(cat, q) : '';
 
-        if (questionMode === 'higher_lower') {
+        if (!cat || !q) {
+            questionDetailHtml = `
+                <div class="text-center text-muted" style="margin-top: 4rem;">
+                    Diese Frage konnte nicht geladen werden.
+                    <button class="btn btn-gold w-100 mt-4" style="padding: 1rem;" onclick="closeQuestion()">Zurück zum Board</button>
+                </div>
+            `;
+        } else if (questionMode === 'higher_lower') {
             const streakIdx = actQ.streakIdx || 0;
             const streakLen = getQuestionStreakLength(cat, q);
             
@@ -1402,14 +1435,12 @@ function renderHostView() {
                         </div>
                     </div>
                     <div class="host-board-grid mt-2">
-                        ${(liveState.currentRound === 1 ? activeGame.categories : (activeGame.categoriesRound2 || [])).map((cat, cIdx) => `
+                        ${getRoundCategories(liveState.currentRound || 1).map((cat, cIdx) => `
                             <div class="host-col">
-                                <div class="text-center font-bold text-muted" style="font-size: 0.75rem; height: 30px; overflow: hidden;">${cat.name}</div>
+                                <div class="text-center font-bold text-muted" style="font-size: 0.75rem; height: 30px; overflow: hidden;">${cat?.name || 'Kategorie'}</div>
                                 ${Array(activeGame.questionsPerCategory || 5).fill(0).map((_, qIdx) => {
                                     const round = liveState.currentRound || 1;
-                                    const catList = round === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
-                                    const cat = catList[cIdx];
-                                    const q = cat.questions[qIdx] || { points: (qIdx+1)*200 };
+                                    const q = getSafeQuestion(round, cIdx, qIdx) || { points: (qIdx+1)*200 };
                                     
                                     const roundMultiplier = round === 2 ? 2 : 1;
                                     const displayPoints = (qIdx + 1) * (activeGame.pointMultiplier || 100) * roundMultiplier;
@@ -1500,8 +1531,9 @@ window.showStatsModal = function() {
 
 window.openQuestion = function(catIndex, qIndex) {
     const round = liveState.currentRound || 1;
-    const catList = round === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
+    const catList = getRoundCategories(round);
     const cat = catList[catIndex];
+    if (!cat) return;
     let q = cat.questions[qIndex];
     
     if (!q) {
@@ -1528,13 +1560,10 @@ window.openQuestion = function(catIndex, qIndex) {
         streakIdx: 0,
         foundItems: [],
         currentPlayerId: null,
-        stealMode: false
+        stealMode: false,
+        hlAdvancing: false
     };
     
-    const qKey = `${round}-${catIndex}-${qIndex}`;
-    if (!liveState.playedQuestions.includes(qKey)) {
-        liveState.playedQuestions.push(qKey);
-    }
     logAction(`Frage geöffnet: ${cat.name} für ${currentPoints}.`);
     broadcastState();
     render();
@@ -1552,6 +1581,7 @@ window.markAttempt = function(pIdx, isCorrect) {
         liveState.stats[player.id].correct++;
         actQ.showAnswer = true;
         actQ.blur = 0;
+        markActiveQuestionPlayed();
         logAction(`${player.name} antwortet RICHTIG (+${points}).`);
     } else {
         const isStealAttempt = !!actQ.stealMode || (actQ.attempts || 0) > 0 || (actQ.attemptedBy || []).length > 0;
@@ -1602,9 +1632,10 @@ window.markListItem = function(itemIdx) {
         logAction(`${player.name} nennt korrekt: ${rankedItems[itemIdx]} (+${points}).`);
     }
 
-    if (actQ.foundItems.length >= rankedItems.length && rankedItems.length > 0) {
-        actQ.showAnswer = true;
-    }
+        if (actQ.foundItems.length >= rankedItems.length && rankedItems.length > 0) {
+            actQ.showAnswer = true;
+            markActiveQuestionPlayed();
+        }
 
     broadcastState();
     render();
@@ -1643,6 +1674,7 @@ window.reduceBlur = function() {
 window.showAnswer = function() {
     if (liveState.activeQuestion) {
         liveState.activeQuestion.showAnswer = true;
+        markActiveQuestionPlayed();
         broadcastState();
         render();
     }
@@ -1655,12 +1687,16 @@ window.nextStreak = function() {
         liveState.activeQuestion.attempts = 0;
         liveState.activeQuestion.attemptedBy = [];
         liveState.activeQuestion.stealMode = false;
+        liveState.activeQuestion.hlAdvancing = false;
         broadcastState();
         render();
     }
 }
 
 window.closeQuestion = function() {
+    if (liveState.activeQuestion?.showAnswer) {
+        markActiveQuestionPlayed();
+    }
     liveState.activeQuestion = null;
     broadcastState();
     render();
@@ -1783,7 +1819,7 @@ function renderPlayerView() {
 
     const actQ = liveState.activeQuestion;
     const currentRound = liveState.currentRound || 1;
-    const currentCategories = currentRound === 1 ? activeGame.categories : (activeGame.categoriesRound2 || []);
+    const currentCategories = getRoundCategories(currentRound);
     let overlayHtml = '';
 
     if (actQ) {
@@ -1819,12 +1855,13 @@ function renderPlayerView() {
                         <div class="active-hl-object" style="${getAdaptiveQuestionStyle(currentSt.object || '-')}">
                             ${currentSt.object || '-'}
                         </div>
-                        ${!actQ.showAnswer ? `
+                        ${!actQ.showAnswer && !actQ.hlAdvancing ? `
                             <div class="active-hl-choice-row">
                                 <button class="btn btn-gold active-hl-choice" onclick="playerGuessHl('Höher', this)">⬆️ Höher</button>
                                 <button class="btn btn-outline active-hl-choice" style="border-width: 4px;" onclick="playerGuessHl('Tiefer', this)">⬇️ Tiefer</button>
                             </div>
                         ` : ''}
+                        ${actQ.hlAdvancing ? '<div class="active-answer-text" style="font-size: 2.4rem;">Weiter...</div>' : ''}
                         ${actQ.showAnswer ? (
                             '<div class="active-hl-result" style="color: ' + (currentSt.solution === 'Höher' ? 'var(--success)' : 'var(--danger)') + ';">' +
                                 (currentSt.solution === 'Höher' ? '⬆️ HÖHER' : '⬇️ TIEFER') +
@@ -1902,8 +1939,8 @@ function renderPlayerView() {
             <div class="board">
                 ${currentCategories.map((cat, cIdx) => `
                     <div class="board-column">
-                        <div class="category-header">${cat.name}</div>
-                        ${Array(activeGame.questionsPerCategory || cat.questions.length).fill(0).map((_, qIdx) => {
+                        <div class="category-header">${cat?.name || 'Kategorie'}</div>
+                        ${Array(activeGame.questionsPerCategory || cat?.questions?.length || 5).fill(0).map((_, qIdx) => {
                             const roundMultiplier = currentRound === 2 ? 2 : 1;
                             const displayPoints = (qIdx + 1) * (activeGame.pointMultiplier || 100) * roundMultiplier;
                             const qKey = `${currentRound}-${cIdx}-${qIdx}`;
