@@ -307,15 +307,7 @@ function mergeAiListItems(existingItems, parsedItems, expectedLength) {
 
 function applyAiSlotData(cat, q, aiEntry) {
     const mode = getQuestionMode(cat, q);
-    let normalizedEntry = aiEntry;
-
-    if ((mode === 'standard' || mode === 'emoji' || mode === 'image_question') && shouldSwapAiQuestionAnswer(aiEntry)) {
-        normalizedEntry = {
-            ...aiEntry,
-            question: aiEntry.answer,
-            answer: aiEntry.question
-        };
-    }
+    const normalizedEntry = flipAiQuestionAnswer(aiEntry);
 
     if (!hasMeaningfulText(q.question) && hasMeaningfulText(normalizedEntry.question)) {
         q.question = normalizedEntry.question.trim();
@@ -356,20 +348,15 @@ function applyAiSlotData(cat, q, aiEntry) {
     }
 }
 
-function shouldSwapAiQuestionAnswer(aiEntry) {
+function flipAiQuestionAnswer(aiEntry) {
     const questionText = String(aiEntry?.question || '').trim();
     const answerText = String(aiEntry?.answer || '').trim();
-    if (!questionText || !answerText) return false;
 
-    const questionLooksLikePrompt = /[?]$/.test(questionText) || questionText.length > 45;
-    const answerLooksLikePrompt = /[?]$/.test(answerText) || answerText.length > 45;
-    const questionLooksLikeSolution = questionText.length <= 40 && !/[?]$/.test(questionText);
-    const answerLooksLikeSolution = answerText.length <= 40 && !/[?]$/.test(answerText);
-
-    if (answerLooksLikePrompt && questionLooksLikeSolution) return true;
-    if (answerText.length > questionText.length * 1.7 && questionLooksLikeSolution) return true;
-    if (questionLooksLikePrompt && answerLooksLikeSolution) return false;
-    return false;
+    return {
+        ...(aiEntry || {}),
+        question: answerText || questionText,
+        answer: questionText || answerText
+    };
 }
 
 function getImageSearchQuery(q) {
@@ -1540,7 +1527,8 @@ window.openQuestion = function(catIndex, qIndex) {
         blur: initialBlur, 
         streakIdx: 0,
         foundItems: [],
-        currentPlayerId: null
+        currentPlayerId: null,
+        stealMode: false
     };
     
     const qKey = `${round}-${catIndex}-${qIndex}`;
@@ -1566,12 +1554,14 @@ window.markAttempt = function(pIdx, isCorrect) {
         actQ.blur = 0;
         logAction(`${player.name} antwortet RICHTIG (+${points}).`);
     } else {
-        const penalty = actQ.attempts === 0 ? points : Math.floor(points / 2);
+        const isStealAttempt = !!actQ.stealMode || (actQ.attempts || 0) > 0 || (actQ.attemptedBy || []).length > 0;
+        const penalty = isStealAttempt ? Math.floor(points / 2) : points;
         player.score -= penalty;
         liveState.stats[player.id].wrong++;
-        actQ.attempts += 1;
-        actQ.attemptedBy.push(player.id);
-        logAction(`${player.name} antwortet FALSCH (-${penalty}).`);
+        actQ.attempts = (actQ.attempts || 0) + 1;
+        actQ.stealMode = true;
+        if (!actQ.attemptedBy.includes(player.id)) actQ.attemptedBy.push(player.id);
+        logAction(`${player.name} antwortet FALSCH (${isStealAttempt ? 'KLAUEN, ' : ''}-${penalty}).`);
     }
     broadcastState();
     render();
@@ -1664,6 +1654,7 @@ window.nextStreak = function() {
         liveState.activeQuestion.showAnswer = false;
         liveState.activeQuestion.attempts = 0;
         liveState.activeQuestion.attemptedBy = [];
+        liveState.activeQuestion.stealMode = false;
         broadcastState();
         render();
     }
@@ -2493,7 +2484,7 @@ async function generateCategoryWithAI(cIdx, apiKey) {
         return `Slot ${spec.idx + 1}: mode=standard, topic="${spec.topic}", points=${spec.points}. ${questionNote} ${fillNote}`;
     }).join('\n');
 
-    const mixedPrompt = `Erstelle genau ${qCount} Jeopardy-Einträge für die Kategorie "${catName}". Schwierigkeit: "${difficulty}".
+    const mixedPrompt = `Erstelle genau ${qCount} Quizkarten für die Kategorie "${catName}". Schwierigkeit: "${difficulty}".
 
 WICHTIG:
 - Antworte AUSSCHLIESSLICH mit einem JSON-Array mit genau ${qCount} Einträgen.
@@ -2505,27 +2496,30 @@ Slots:
 ${specText}
 
 Regeln pro mode:
-- standard: {"question":"Frage","answer":"Antwort"}
-- image_question: {"question":"Bildfrage","answer":"Lösung","imageQuery":"präziser Wikimedia-Commons-Bildsuchbegriff","image":""}
-- emoji: {"question":"nur Emojis","answer":"Lösung"}
-- higher_lower: {"question":"Basis-Aussage mit Zahl","hlStreak":[{"object":"Objekt","solution":"Höher oder Tiefer","fact":"Zusatzfakt"}]}
-- list_builder: {"question":"Nenne ...","listItems":["Platz 1","Platz 2"]}
+- standard: {"question":"kurze richtige Lösung","answer":"ausformulierte Quizfrage, die Spieler sehen"}
+- image_question: {"question":"Lösung","answer":"Bildfrage","imageQuery":"präziser Wikimedia-Commons-Bildsuchbegriff","image":""}
+- emoji: {"question":"Lösung","answer":"nur Emojis"}
+- higher_lower: {"question":"kurzer Titel oder Lösung","answer":"Basis-Aussage mit Zahl","hlStreak":[{"object":"Objekt","solution":"Höher oder Tiefer","fact":"Zusatzfakt"}]}
+- list_builder: {"question":"kurzer Titel oder Lösung","answer":"Nenne ...","listItems":["Platz 1","Platz 2"]}
 
 Zusatzregeln:
-- Bei standard und emoji gilt: "question" ist immer das, was den Spielern angezeigt wird. "answer" ist immer die richtige Lösung.
-- Bei image_question gilt: "question" ist die Textfrage zum Bild, "answer" ist das gesuchte Objekt/Land/Auto/etc. Beschreibe das Bild nicht als Textlösung. imageQuery muss ein konkreter Suchbegriff sein, mit dem Wikimedia Commons genau dieses Bild finden kann, z.B. "Flag of Brazil", "BMW E30 Wikimedia Commons" oder "Eiffel Tower Paris Wikimedia Commons". Lasse image leer, die App sucht das Bild danach automatisch.
-- Bei Flaggen-Bildfragen darf "question" NIEMALS die Farben, Muster, Symbole oder Form der Flagge beschreiben. Nutze nur eine neutrale Frage wie "Welche Flagge ist das?" und setze die Lösung in "answer".
+- Technische Regel: Die App dreht question und answer beim Speichern automatisch um.
+- Darum gilt im JSON absichtlich: "question" = Lösung/gesuchter Name, "answer" = sichtbare Frage/Aufgabe/Basis-Aussage.
+- Beispiel richtig für standard im JSON: {"question":"Paris","answer":"Welche Stadt ist die Hauptstadt von Frankreich?"}
+- Beispiel falsch für standard im JSON: {"question":"Welche Stadt ist die Hauptstadt von Frankreich?","answer":"Paris"}
+- Bei image_question gilt im JSON: "question" ist die Lösung, "answer" ist die neutrale Textfrage zum Bild. Beschreibe das Bild nicht als Textlösung. imageQuery muss ein konkreter Suchbegriff sein, mit dem Wikimedia Commons genau dieses Bild finden kann, z.B. "Flag of Brazil", "BMW E30 Wikimedia Commons" oder "Eiffel Tower Paris Wikimedia Commons". Lasse image leer, die App sucht das Bild danach automatisch.
+- Bei Flaggen-Bildfragen darf "answer" NIEMALS die Farben, Muster, Symbole oder Form der Flagge beschreiben. Nutze nur eine neutrale Frage wie "Welche Flagge ist das?" und setze die Lösung in "question".
 - Bei Flaggen-Bildfragen müssen die Punkte schwerer werden: difficultyRank 1 = sehr bekannte Flaggen/Länder, 2 = bekannte Länder, 3 = mittelbekannte Länder, 4 = schwierige Länder/kleinere Staaten, 5 = sehr schwere/seltene Länder oder Territorien. Verwende keine doppelte Lösung in derselben Kategorie.
 - Bei Flaggen-Bildfragen muss imageQuery exakt im Format "Flag of <englischer Landesname>" sein, damit die App die richtige Commons-Datei suchen kann.
 - Bildfragen eignen sich besonders für Flaggen, Autos, Logos, Karten, Personen, Tiere, Orte und Gegenstände.
 - Verwende NICHT das amerikanische Jeopardy-TV-Prinzip mit vertauschten Rollen. Frage und Antwort dürfen niemals vertauscht sein.
 - Wenn bei einem Slot bereits eine question vorgegeben ist, darfst du diese question nicht neu formulieren oder ändern.
-- Fülle in diesem Fall nur die fehlenden Inhalte für diesen Slot aus.
+- Fülle in diesem Fall nur die fehlenden Inhalte für diesen Slot aus. Bei normalen Frage/Antwort-Feldern kommt die fehlende Lösung im JSON trotzdem in "question", weil die App danach dreht.
 - Wenn answer, hlStreak-Einträge oder listItems schon teilweise vorgegeben sind, liefere trotzdem das vollständige Format zurück, aber überschreibe semantisch nichts Vorhandenes.
 - higher_lower: keine Fragen formulieren, sondern reine Fakten-Aussagen; hlStreak muss genau die angegebene streakLen haben.
 - list_builder: listItems muss genau die angegebene listLength haben.
 - emoji: question darf nur aus Emojis bestehen.
-- standard: kurze spielbare Jeopardy-Frage mit Antwort.`;
+- standard: kurze normale Quizfrage mit kurzer Lösung, aber im JSON technisch gedreht wie oben beschrieben.`;
     let prompt = mixedPrompt;
     if (isMinigame && minigameType === 'higher_lower') {
         if (streakLen > 1) {
